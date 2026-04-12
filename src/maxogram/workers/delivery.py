@@ -15,6 +15,11 @@ from maxogram.db.session import Database
 from maxogram.domain import OutboxAction, Platform, TaskStatus
 from maxogram.metrics import dlq_total, retry_total
 from maxogram.platforms.base import PlatformClient, PlatformDeliveryError
+from maxogram.runtime_resilience import (
+    RuntimeBackoffState,
+    is_retryable_worker_error,
+    wait_or_stop,
+)
 from maxogram.services.media import resolve_media_identity
 from maxogram.services.relay import cleanup_local_media, materialize_media
 from maxogram.services.retry import retry_decision
@@ -69,18 +74,28 @@ class DeliveryWorker:
         self.idle_seconds = idle_seconds
         self.root_dir = root_dir
         self.batch_size = batch_size
+        self._retry_backoff = RuntimeBackoffState()
 
     async def run(self) -> None:
         while not self.stop_event.is_set():
             try:
                 processed = await self.run_once()
-                if processed == 0:
-                    await asyncio.sleep(self.idle_seconds)
+                self._log_recovery_if_needed()
+                if processed == 0 and await wait_or_stop(
+                    self.stop_event, self.idle_seconds
+                ):
+                    return
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                if is_retryable_worker_error(exc):
+                    if await self._wait_after_retryable_failure(exc):
+                        return
+                    continue
+                self._retry_backoff.clear()
                 logger.exception("Delivery failed")
-                await asyncio.sleep(self.idle_seconds)
+                if await wait_or_stop(self.stop_event, self.idle_seconds):
+                    return
 
     async def run_once(self) -> int:
         async with self.database.session() as session:
@@ -483,6 +498,27 @@ class DeliveryWorker:
             raise
         except Exception:
             logger.exception("Lease heartbeat join failed")
+
+    async def _wait_after_retryable_failure(self, exc: BaseException) -> bool:
+        delay_seconds = self._retry_backoff.next_delay_seconds()
+        logger.warning(
+            "%s temporary failure attempt=%s error=%s retry_in=%.0fs: %s",
+            self.name,
+            self._retry_backoff.attempts,
+            exc.__class__.__name__,
+            delay_seconds,
+            exc,
+        )
+        return await wait_or_stop(self.stop_event, delay_seconds)
+
+    def _log_recovery_if_needed(self) -> None:
+        recovered_attempts = self._retry_backoff.clear()
+        if recovered_attempts:
+            logger.info(
+                "%s recovered after %s temporary failure(s)",
+                self.name,
+                recovered_attempts,
+            )
 
 
 def _expect_dict(value: Any, name: str) -> dict[str, Any]:

@@ -4,6 +4,7 @@
 
 - Runtime: the project runs as a single asyncio process with five worker loops: Telegram poller, MAX poller, normalizer, delivery, and reconciliation. Production configuration is env-first with `tokens.py` kept as a fallback for local development, and PostgreSQL is the only durable store for state and queueing.
 - Supported behavior: bidirectional text relay with alias prefixes, native replies where mappings exist, real media relay for common attachment types, GIF and animation handling, supported Telegram/MAX formatting preservation, repeated-forward unwrap for mirrored bot messages so alias wrappers and forwarded media survive re-forwarding cleanly, bridge commands, and mirrored edit/delete sync with pending-mutation replay.
+- Installer behavior: local PostgreSQL installs now resolve one explicit live cluster or instance before any admin action, prefer preserving existing Maxogram data over blindly picking the newest version, and fail closed instead of silently falling back to port `5432` after discovery errors.
 - Known limitations: ordinary Telegram chat-history deletions are still not broadly visible to the bot, service/member events are not broadly mirrored yet, proxy DB settings and `media_objects` are not wired into runtime, metrics are collected but not exposed, and secrets still come from `tokens.py` rather than DB-backed credentials.
 - Schema and migrations: one Alembic revision, `20260410_0001`, creates the current SQLAlchemy metadata; there are no later incremental migrations yet.
 - Test coverage: automated tests cover config loading, deduplication, commands, normalization, rendering, pollers, delivery, reconciliation, platform clients, and optional database connectivity.
@@ -48,3 +49,12 @@
 - Added installer `update` mode, switched the canonical PostgreSQL app role default to `maxogram_app`, and taught the installer to rebuild `/etc/maxogram/maxogram.env` around existing local Maxogram databases without dropping bridge or alias data.
 - Split installer behavior between local and remote PostgreSQL hosts so remote `manual` installs skip local PostgreSQL provisioning, while the installer never edits `pg_hba.conf`, `listen_addresses`, or firewall state.
 - Updated `README.md` and installer static tests to document tarball-based installs, `update`, the `maxogram` OS user plus `maxogram_app` DB user defaults, and the explicit no-firewall/no-network-policy-change guarantees.
+
+## 2026-04-13
+
+- Reworked `install.sh` so local PostgreSQL admin actions always run against one explicitly resolved target instead of bare `psql` or `createdb`, eliminating Debian `pg_wrapper` mis-selection and silent fallback to `5432`.
+- Added Debian cluster discovery through `pg_lsclusters`, including cluster-specific binary selection, safe reuse of existing Maxogram env and database state, and explicit ambiguity errors when multiple top-priority live clusters remain.
+- Added generic Linux local PostgreSQL discovery via running postmaster processes and `postmaster.pid`, including port, socket, config, and service-unit resolution without hardcoding version-specific service names.
+- Updated local installer role, database, search-path, and manual port-change flows to use the selected PostgreSQL target metadata consistently, including re-discovery after a local port rewrite.
+- Made `install.sh` sourceable for pytest-based helper coverage and added installer behavior tests for Debian and generic multi-instance selection, preserve-data priority, ambiguity failures, remote-host bypass, and local port rewrites.
+- Updated `README.md` to document the new local PostgreSQL target selection order and the stricter handling of non-default local PostgreSQL ports.

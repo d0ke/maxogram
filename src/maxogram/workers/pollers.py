@@ -9,6 +9,11 @@ from maxogram.db.session import Database
 from maxogram.domain import Platform
 from maxogram.metrics import duplicate_update_total
 from maxogram.platforms.base import PlatformClient, PlatformDeliveryError
+from maxogram.runtime_resilience import (
+    RuntimeBackoffState,
+    is_transient_db_error,
+    wait_or_stop,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,7 @@ class PollerWorker:
         self.timeout = timeout
         self.idle_seconds = idle_seconds
         self.name = f"{platform.value}-poller"
+        self._retry_backoff = RuntimeBackoffState()
 
     async def run(self) -> None:
         while not self.stop_event.is_set():
@@ -43,11 +49,25 @@ class PollerWorker:
             except asyncio.CancelledError:
                 raise
             except PlatformDeliveryError as exc:
+                if exc.retryable:
+                    if await self._wait_after_retryable_failure(exc):
+                        return
+                    continue
+                self._retry_backoff.clear()
                 logger.warning("%s polling failed: %s", self.name, exc)
-                await asyncio.sleep(self.idle_seconds)
-            except Exception:
+                if await wait_or_stop(self.stop_event, self.idle_seconds):
+                    return
+            except Exception as exc:
+                if is_transient_db_error(exc):
+                    if await self._wait_after_retryable_failure(exc):
+                        return
+                    continue
+                self._retry_backoff.clear()
                 logger.exception("%s crashed during polling", self.name)
-                await asyncio.sleep(self.idle_seconds)
+                if await wait_or_stop(self.stop_event, self.idle_seconds):
+                    return
+            else:
+                self._log_recovery_if_needed()
 
     async def run_once(self) -> int:
         async with self.database.session() as session:
@@ -81,3 +101,24 @@ class PollerWorker:
                         self.platform, self.bot_id, batch.next_cursor
                     )
         return inserted
+
+    async def _wait_after_retryable_failure(self, exc: BaseException) -> bool:
+        delay_seconds = self._retry_backoff.next_delay_seconds()
+        logger.warning(
+            "%s temporary failure attempt=%s error=%s retry_in=%.0fs: %s",
+            self.name,
+            self._retry_backoff.attempts,
+            exc.__class__.__name__,
+            delay_seconds,
+            exc,
+        )
+        return await wait_or_stop(self.stop_event, delay_seconds)
+
+    def _log_recovery_if_needed(self) -> None:
+        recovered_attempts = self._retry_backoff.clear()
+        if recovered_attempts:
+            logger.info(
+                "%s recovered after %s temporary failure(s)",
+                self.name,
+                recovered_attempts,
+            )

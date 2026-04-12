@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+import uuid
 from contextlib import suppress
 from typing import Protocol
 
@@ -13,6 +14,11 @@ from .domain import Platform
 from .platforms.base import PlatformClient
 from .platforms.max import MaxClient
 from .platforms.telegram import TelegramClient
+from .runtime_resilience import (
+    RuntimeBackoffState,
+    is_transient_db_error,
+    wait_or_stop,
+)
 from .services.commands import CommandProcessor
 from .workers.delivery import DeliveryWorker
 from .workers.normalizer import NormalizerWorker
@@ -41,15 +47,10 @@ class MaxogramApp:
                 loop.add_signal_handler(sig, self.stop_event.set)
 
         async with self.database:
-            async with self.database.session() as session:
-                repo = Repository(session)
-                telegram_bot_id = await repo.ensure_bot_credential(
-                    Platform.TELEGRAM
-                )
-                max_bot_id = await repo.ensure_bot_credential(Platform.MAX)
-                await repo.ensure_proxy_profile(Platform.TELEGRAM)
-                await repo.ensure_proxy_profile(Platform.MAX)
-                await session.commit()
+            bootstrap = await self._bootstrap_database_until_ready()
+            if bootstrap is None:
+                return
+            telegram_bot_id, max_bot_id = bootstrap
 
             telegram = TelegramClient(self.settings.telegram_token)
             max_client = MaxClient(self.settings.max_token)
@@ -113,3 +114,45 @@ class MaxogramApp:
                 await asyncio.gather(*tasks, return_exceptions=True)
                 await telegram.close()
                 await max_client.close()
+
+    async def _bootstrap_database_until_ready(
+        self,
+    ) -> tuple[uuid.UUID, uuid.UUID] | None:
+        backoff = RuntimeBackoffState()
+        while not self.stop_event.is_set():
+            try:
+                bootstrap = await self._bootstrap_database_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not is_transient_db_error(exc):
+                    raise
+                delay_seconds = backoff.next_delay_seconds()
+                logger.warning(
+                    "Database bootstrap failed attempt=%s error=%s retry_in=%.0fs: %s",
+                    backoff.attempts,
+                    exc.__class__.__name__,
+                    delay_seconds,
+                    exc,
+                )
+                if await wait_or_stop(self.stop_event, delay_seconds):
+                    return None
+            else:
+                recovered_attempts = backoff.clear()
+                if recovered_attempts:
+                    logger.info(
+                        "Database bootstrap recovered after %s temporary failure(s)",
+                        recovered_attempts,
+                    )
+                return bootstrap
+        return None
+
+    async def _bootstrap_database_once(self) -> tuple[uuid.UUID, uuid.UUID]:
+        async with self.database.session() as session:
+            repo = Repository(session)
+            telegram_bot_id = await repo.ensure_bot_credential(Platform.TELEGRAM)
+            max_bot_id = await repo.ensure_bot_credential(Platform.MAX)
+            await repo.ensure_proxy_profile(Platform.TELEGRAM)
+            await repo.ensure_proxy_profile(Platform.MAX)
+            await session.commit()
+        return telegram_bot_id, max_bot_id

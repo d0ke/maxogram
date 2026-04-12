@@ -8,6 +8,11 @@ from typing import Any
 from maxogram.db.repositories import Repository
 from maxogram.db.session import Database
 from maxogram.domain import OutboxAction, Platform
+from maxogram.runtime_resilience import (
+    RuntimeBackoffState,
+    is_transient_db_error,
+    wait_or_stop,
+)
 from maxogram.services.dedup import outbox_dedup_key, partition_key
 
 logger = logging.getLogger(__name__)
@@ -30,16 +35,24 @@ class ReconciliationWorker:
         self.idle_seconds = idle_seconds
         self.pending_batch_size = pending_batch_size
         self.pending_retry_seconds = pending_retry_seconds
+        self._retry_backoff = RuntimeBackoffState()
 
     async def run(self) -> None:
         while not self.stop_event.is_set():
             try:
                 await self.run_once()
+                self._log_recovery_if_needed()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                if is_transient_db_error(exc):
+                    if await self._wait_after_retryable_failure(exc):
+                        return
+                    continue
+                self._retry_backoff.clear()
                 logger.exception("Reconciliation failed")
-            await asyncio.sleep(self.idle_seconds)
+            if await wait_or_stop(self.stop_event, self.idle_seconds):
+                return
 
     async def run_once(self) -> tuple[int, int, int]:
         async with self.database.session() as session:
@@ -138,6 +151,27 @@ class ReconciliationWorker:
         if bridge_chat is None:
             return None
         return {"platform": bridge_chat.platform.value, "chat_id": bridge_chat.chat_id}
+
+    async def _wait_after_retryable_failure(self, exc: BaseException) -> bool:
+        delay_seconds = self._retry_backoff.next_delay_seconds()
+        logger.warning(
+            "%s temporary failure attempt=%s error=%s retry_in=%.0fs: %s",
+            self.name,
+            self._retry_backoff.attempts,
+            exc.__class__.__name__,
+            delay_seconds,
+            exc,
+        )
+        return await wait_or_stop(self.stop_event, delay_seconds)
+
+    def _log_recovery_if_needed(self) -> None:
+        recovered_attempts = self._retry_backoff.clear()
+        if recovered_attempts:
+            logger.info(
+                "%s recovered after %s temporary failure(s)",
+                self.name,
+                recovered_attempts,
+            )
 
     def _next_pending_attempt_at(self, pending: Any) -> datetime:
         return min(

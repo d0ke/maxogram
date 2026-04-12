@@ -40,7 +40,7 @@ Auto defaults:
 - app directory: `/opt/maxogram`
 - env file: `/etc/maxogram/maxogram.env`
 - database host: `127.0.0.1`
-- database port: detected running PostgreSQL port, or `5432`
+- database port: detected selected local PostgreSQL instance port; `5432` is only the pre-detection fallback for fresh single-instance installs
 - database name: `maxogram`
 - database user: `maxogram_app`
 - schema name: `maxogram`
@@ -89,7 +89,8 @@ Update mode:
 - downloads the public GitHub tarball for `main` instead of using `git`
 - installs PostgreSQL if it is missing and a local database host is being used
 - uses the detected package manager when one is available: `apt`, `dnf`, `zypper`, or `pacman`
-- detects the current PostgreSQL port and can reconfigure it in `manual` mode for local PostgreSQL
+- resolves one concrete local PostgreSQL target before any admin action and can reconfigure its port in `manual` mode
+- selects a local PostgreSQL target in this order: existing local Maxogram env port match, cluster or instance already containing the Maxogram role or database, highest live major version, otherwise an explicit ambiguity error
 - creates or reuses the local PostgreSQL role, database, and schema when PostgreSQL is local
 - reuses existing Maxogram data and applies only `python -m maxogram db-upgrade`
 - creates or reuses the dedicated `maxogram` system user

@@ -48,11 +48,24 @@ PYTHON_COMMAND_CANDIDATES=()
 POSTGRES_SERVICE_UNIT=""
 CRON_SERVICE_UNIT=""
 WATCHDOG_MODE="none"
-POSTGRES_DATA_DIR=""
+POSTGRES_DEFAULT_DATA_DIR=""
 SYSTEMCTL_BIN=""
 NOLOGIN_SHELL=""
 PSQL_BIN=""
 CREATEDB_BIN=""
+POSTGRES_MAJOR_VERSION=""
+POSTGRES_CLUSTER_NAME=""
+POSTGRES_BIN_DIR=""
+POSTGRES_DATA_DIR=""
+POSTGRES_CONFIG_FILE=""
+POSTGRES_SOCKET_DIR=""
+POSTGRES_PORT=""
+POSTGRES_SELECTION_SOURCE=""
+POSTGRES_SELECTED_RECORD=""
+POSTGRES_DISCOVERY_CANDIDATES=()
+POSTGRES_ETC_ROOT="${POSTGRES_ETC_ROOT:-/etc/postgresql}"
+POSTGRES_LIB_ROOT="${POSTGRES_LIB_ROOT:-/usr/lib/postgresql}"
+POSTGRES_PGSQL_ROOT_PREFIX="${POSTGRES_PGSQL_ROOT_PREFIX:-/usr/pgsql-}"
 
 TG_BOT_TOKEN=""
 MAX_BOT_TOKEN=""
@@ -163,7 +176,7 @@ configure_package_manager() {
   POSTGRES_SERVICE_CANDIDATES=("postgresql" "postgresql.service")
   CRON_SERVICE_CANDIDATES=("cron" "cron.service" "crond" "crond.service" "cronie" "cronie.service")
   PYTHON_COMMAND_CANDIDATES=("python3.13" "python3" "python")
-  POSTGRES_DATA_DIR=""
+  POSTGRES_DEFAULT_DATA_DIR=""
 
   case "${PKG_MANAGER}" in
     apt)
@@ -182,10 +195,10 @@ configure_package_manager() {
       CRON_PACKAGE_GROUPS=("cronie")
       PYTHON_PACKAGE_GROUPS=("python3.13 python3.13-devel" "python3 python3-devel")
       BUILD_DEP_PACKAGE_GROUPS=("bzip2-devel gcc gdbm-devel libffi-devel make ncurses-devel openssl-devel readline-devel sqlite-devel tk-devel xz-devel zlib-devel")
-      POSTGRES_SERVICE_CANDIDATES=("postgresql" "postgresql.service" "postgresql-16" "postgresql-15")
+      POSTGRES_SERVICE_CANDIDATES=("postgresql" "postgresql.service")
       CRON_SERVICE_CANDIDATES=("crond" "crond.service" "cronie" "cronie.service")
       PYTHON_COMMAND_CANDIDATES=("python3.13" "python3")
-      POSTGRES_DATA_DIR="/var/lib/pgsql/data"
+      POSTGRES_DEFAULT_DATA_DIR="/var/lib/pgsql/data"
       ;;
     zypper)
       BASE_PACKAGE_GROUPS=("ca-certificates coreutils curl grep sed gawk procps tar")
@@ -196,7 +209,7 @@ configure_package_manager() {
       POSTGRES_SERVICE_CANDIDATES=("postgresql" "postgresql.service")
       CRON_SERVICE_CANDIDATES=("cron" "cron.service")
       PYTHON_COMMAND_CANDIDATES=("python3.13" "python3" "python")
-      POSTGRES_DATA_DIR="/var/lib/pgsql/data"
+      POSTGRES_DEFAULT_DATA_DIR="/var/lib/pgsql/data"
       ;;
     pacman)
       BASE_PACKAGE_GROUPS=("ca-certificates coreutils curl grep sed gawk procps-ng tar")
@@ -207,7 +220,7 @@ configure_package_manager() {
       POSTGRES_SERVICE_CANDIDATES=("postgresql" "postgresql.service")
       CRON_SERVICE_CANDIDATES=("cronie" "cronie.service" "crond" "crond.service")
       PYTHON_COMMAND_CANDIDATES=("python" "python3")
-      POSTGRES_DATA_DIR="/var/lib/postgres/data"
+      POSTGRES_DEFAULT_DATA_DIR="/var/lib/postgres/data"
       ;;
     *)
       BASE_PACKAGE_GROUPS=()
@@ -218,7 +231,7 @@ configure_package_manager() {
       POSTGRES_SERVICE_CANDIDATES=("postgresql" "postgresql.service")
       CRON_SERVICE_CANDIDATES=("cron" "cron.service" "crond" "crond.service" "cronie" "cronie.service")
       PYTHON_COMMAND_CANDIDATES=("python3.13" "python3" "python")
-      POSTGRES_DATA_DIR=""
+      POSTGRES_DEFAULT_DATA_DIR=""
       ;;
   esac
 }
@@ -439,29 +452,87 @@ service_reload_or_restart_candidates() {
 
 find_postgres_binary() {
   local name="$1"
+  local preferred_version="${2:-}"
+  local preferred_bin_dir="${3:-}"
   local candidate
   local resolved
 
-  if have_cmd "${name}"; then
-    command -v "${name}"
+  if [[ -n "${preferred_bin_dir}" && -x "${preferred_bin_dir}/${name}" ]]; then
+    printf '%s\n' "${preferred_bin_dir}/${name}"
     return 0
   fi
 
-  for candidate in "/usr/bin/${name}" "/usr/lib/postgresql*/bin/${name}" "/usr/pgsql-*/bin/${name}"; do
-    for resolved in ${candidate}; do
-      if [[ -x "${resolved}" ]]; then
-        printf '%s\n' "${resolved}"
+  if [[ -n "${preferred_version}" ]]; then
+    for candidate in \
+      "${POSTGRES_LIB_ROOT}/${preferred_version}/bin/${name}" \
+      "${POSTGRES_PGSQL_ROOT_PREFIX}${preferred_version}/bin/${name}"; do
+      if [[ -x "${candidate}" ]]; then
+        printf '%s\n' "${candidate}"
         return 0
       fi
     done
+  fi
+
+  if have_cmd "${name}"; then
+    resolved="$(command -v "${name}")"
+    if [[ -x "${resolved}" ]]; then
+      printf '%s\n' "${resolved}"
+      return 0
+    fi
+  fi
+
+  for candidate in "/usr/bin/${name}"; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  for candidate in "${POSTGRES_LIB_ROOT}"/*/bin/"${name}" "${POSTGRES_PGSQL_ROOT_PREFIX}"*/bin/"${name}"; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+postgres_bin_dir_for_version() {
+  local version="$1"
+  local candidate
+
+  [[ -n "${version}" ]] || return 1
+
+  for candidate in \
+    "${POSTGRES_LIB_ROOT}/${version}/bin" \
+    "${POSTGRES_PGSQL_ROOT_PREFIX}${version}/bin"; do
+    if [[ -d "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
   done
 
   return 1
 }
 
 refresh_postgres_binaries() {
-  PSQL_BIN="$(find_postgres_binary psql || true)"
-  CREATEDB_BIN="$(find_postgres_binary createdb || true)"
+  PSQL_BIN="$(find_postgres_binary psql "${POSTGRES_MAJOR_VERSION:-}" "${POSTGRES_BIN_DIR:-}" || true)"
+  CREATEDB_BIN="$(find_postgres_binary createdb "${POSTGRES_MAJOR_VERSION:-}" "${POSTGRES_BIN_DIR:-}" || true)"
+}
+
+reset_local_postgres_target() {
+  POSTGRES_MAJOR_VERSION=""
+  POSTGRES_CLUSTER_NAME=""
+  POSTGRES_SERVICE_UNIT=""
+  POSTGRES_BIN_DIR=""
+  POSTGRES_DATA_DIR=""
+  POSTGRES_CONFIG_FILE=""
+  POSTGRES_SOCKET_DIR=""
+  POSTGRES_PORT=""
+  POSTGRES_SELECTION_SOURCE=""
+  POSTGRES_SELECTED_RECORD=""
+  POSTGRES_DISCOVERY_CANDIDATES=()
 }
 
 run_as_postgres() {
@@ -518,8 +589,8 @@ ensure_base_packages() {
 }
 
 resolve_postgres_data_dir() {
-  if [[ -n "${POSTGRES_DATA_DIR}" ]]; then
-    printf '%s\n' "${POSTGRES_DATA_DIR}"
+  if [[ -n "${POSTGRES_DEFAULT_DATA_DIR}" ]]; then
+    printf '%s\n' "${POSTGRES_DEFAULT_DATA_DIR}"
     return 0
   fi
 
@@ -528,6 +599,483 @@ resolve_postgres_data_dir() {
   else
     printf '%s\n' "/var/lib/pgsql/data"
   fi
+}
+
+postgres_port_from_pid_file() {
+  local data_dir="$1"
+  local pid_file="${data_dir}/postmaster.pid"
+  [[ -f "${pid_file}" ]] || return 1
+  sed -n '4p' "${pid_file}" 2>/dev/null | tr -d '[:space:]\r'
+}
+
+postgres_socket_dir_from_pid_file() {
+  local data_dir="$1"
+  local pid_file="${data_dir}/postmaster.pid"
+  local socket_dir=""
+
+  [[ -f "${pid_file}" ]] || return 1
+  socket_dir="$(sed -n '5p' "${pid_file}" 2>/dev/null | tr -d '\r')"
+  if [[ -z "${socket_dir}" ]]; then
+    if [[ "${DISTRO_FAMILY}" == "debian" ]]; then
+      socket_dir="/var/run/postgresql"
+    else
+      socket_dir="/tmp"
+    fi
+  fi
+  printf '%s\n' "${socket_dir}"
+}
+
+postgres_pid_from_pid_file() {
+  local data_dir="$1"
+  local pid_file="${data_dir}/postmaster.pid"
+  [[ -f "${pid_file}" ]] || return 1
+  sed -n '1p' "${pid_file}" 2>/dev/null | tr -d '[:space:]\r'
+}
+
+postgres_version_from_data_dir() {
+  local data_dir="$1"
+  local version_file="${data_dir}/PG_VERSION"
+  [[ -f "${version_file}" ]] || return 1
+  sed -n '1p' "${version_file}" 2>/dev/null | tr -d '[:space:]\r'
+}
+
+build_postgres_candidate() {
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}"
+}
+
+postgres_candidate_label() {
+  local record="$1"
+  local version cluster port status data_dir config_file service_unit bin_dir socket_dir source pid
+  IFS='|' read -r version cluster port status data_dir config_file service_unit bin_dir socket_dir source pid <<< "${record}"
+
+  if [[ -n "${cluster}" ]]; then
+    printf '%s/%s on %s' "${version}" "${cluster}" "${port}"
+  else
+    printf '%s on %s' "${data_dir}" "${port}"
+  fi
+}
+
+postgres_candidate_reason_label() {
+  local record="$1"
+  local version cluster port status data_dir config_file service_unit bin_dir socket_dir source pid
+  IFS='|' read -r version cluster port status data_dir config_file service_unit bin_dir socket_dir source pid <<< "${record}"
+
+  if [[ -n "${cluster}" ]]; then
+    printf 'cluster %s/%s' "${version}" "${cluster}"
+  else
+    printf 'instance %s' "${data_dir}"
+  fi
+}
+
+postgres_die_ambiguous_candidates() {
+  local reason="$1"
+  shift
+  local record
+
+  warn "${reason}"
+  for record in "$@"; do
+    warn "Candidate: $(postgres_candidate_label "${record}")"
+  done
+  die "${reason}"
+}
+
+postgres_candidate_query_raw() {
+  local record="$1"
+  local sql="$2"
+  local db_name="${3:-postgres}"
+  local version cluster port status data_dir config_file service_unit bin_dir socket_dir source pid
+  local candidate_psql=""
+
+  IFS='|' read -r version cluster port status data_dir config_file service_unit bin_dir socket_dir source pid <<< "${record}"
+  [[ -n "${port}" ]] || return 1
+  [[ -n "${socket_dir}" ]] || return 1
+
+  candidate_psql="$(find_postgres_binary psql "${version}" "${bin_dir}" || true)"
+  [[ -n "${candidate_psql}" ]] || return 1
+
+  run_as_postgres env PGHOST="${socket_dir}" PGPORT="${port}" \
+    "${candidate_psql}" -X -v ON_ERROR_STOP=1 -h "${socket_dir}" -p "${port}" -d "${db_name}" -tAc "${sql}" 2>/dev/null
+}
+
+postgres_candidate_query_scalar() {
+  local record="$1"
+  local sql="$2"
+  local db_name="${3:-postgres}"
+
+  postgres_candidate_query_raw "${record}" "${sql}" "${db_name}" | tr -d '[:space:]\r'
+}
+
+postgres_candidate_match_score() {
+  local record="$1"
+  local db_exists=""
+  local role_exists=""
+  local score=0
+
+  db_exists="$(postgres_candidate_query_scalar "${record}" "SELECT 1 FROM pg_database WHERE datname='$(escape_sql_literal "${DB_NAME}")';" || true)"
+  role_exists="$(postgres_candidate_query_scalar "${record}" "SELECT 1 FROM pg_roles WHERE rolname='$(escape_sql_literal "${DB_USER}")';" || true)"
+
+  if [[ "${db_exists}" == "1" ]]; then
+    score=$((score + 2))
+  fi
+  if [[ "${role_exists}" == "1" ]]; then
+    score=$((score + 1))
+  fi
+
+  printf '%s\n' "${score}"
+}
+
+selected_postgres_query_raw() {
+  local sql="$1"
+  local db_name="${2:-postgres}"
+
+  [[ -n "${PSQL_BIN}" ]] || die "PostgreSQL target is not resolved: psql path is missing."
+  [[ -n "${POSTGRES_SOCKET_DIR}" ]] || die "PostgreSQL target is not resolved: socket directory is missing."
+  [[ -n "${POSTGRES_PORT}" ]] || die "PostgreSQL target is not resolved: port is missing."
+
+  run_as_postgres env PGHOST="${POSTGRES_SOCKET_DIR}" PGPORT="${POSTGRES_PORT}" \
+    "${PSQL_BIN}" -X -v ON_ERROR_STOP=1 -h "${POSTGRES_SOCKET_DIR}" -p "${POSTGRES_PORT}" -d "${db_name}" -tAc "${sql}"
+}
+
+selected_postgres_query_scalar() {
+  local sql="$1"
+  local db_name="${2:-postgres}"
+  selected_postgres_query_raw "${sql}" "${db_name}" | tr -d '[:space:]\r'
+}
+
+selected_postgres_query_line() {
+  local sql="$1"
+  local db_name="${2:-postgres}"
+  selected_postgres_query_raw "${sql}" "${db_name}" | head -n 1 | tr -d '\r' | sed -e 's/[[:space:]]*$//'
+}
+
+list_postgres_service_units() {
+  [[ -n "${SYSTEMCTL_BIN}" ]] || return 1
+  "${SYSTEMCTL_BIN}" list-units --type=service --all --plain --no-legend 2>/dev/null \
+    | awk '{print $1}' \
+    | grep -E 'postgres|pgsql' || true
+}
+
+detect_postgres_service_unit_for_pid() {
+  local pid="$1"
+  local unit=""
+  local main_pid=""
+  local active_state=""
+  local units=()
+
+  while IFS= read -r unit; do
+    [[ -n "${unit}" ]] || continue
+    units+=("${unit}")
+  done < <(list_postgres_service_units)
+
+  for unit in "${units[@]}"; do
+    main_pid="$("${SYSTEMCTL_BIN}" show -p MainPID --value "${unit}" 2>/dev/null || true)"
+    if [[ "${main_pid}" == "${pid}" ]]; then
+      printf '%s\n' "${unit}"
+      return 0
+    fi
+  done
+
+  for unit in "${units[@]}"; do
+    active_state="$("${SYSTEMCTL_BIN}" show -p ActiveState --value "${unit}" 2>/dev/null || true)"
+    if [[ "${active_state}" == "active" ]]; then
+      printf '%s\n' "${unit}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+collect_debian_pg_lsclusters_candidates() {
+  local filter="${1:-online}"
+  local raw_output=""
+  local line=""
+  local version cluster port status data_dir config_file service_unit bin_dir socket_dir pid
+
+  POSTGRES_DISCOVERY_CANDIDATES=()
+  have_cmd pg_lsclusters || return 1
+  raw_output="$(pg_lsclusters 2>/dev/null || true)"
+  [[ -n "${raw_output}" ]] || return 1
+
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    IFS='|' read -r version cluster port status data_dir <<< "${line}"
+    [[ -n "${version}" && -n "${cluster}" ]] || continue
+    if [[ "${filter}" == "online" && "${status}" != "online" ]]; then
+      continue
+    fi
+    config_file="${POSTGRES_ETC_ROOT}/${version}/${cluster}/postgresql.conf"
+    service_unit="postgresql@${version}-${cluster}.service"
+    bin_dir="$(postgres_bin_dir_for_version "${version}" || true)"
+    socket_dir="$(postgres_socket_dir_from_pid_file "${data_dir}" || true)"
+    pid="$(postgres_pid_from_pid_file "${data_dir}" || true)"
+    POSTGRES_DISCOVERY_CANDIDATES+=("$(build_postgres_candidate "${version}" "${cluster}" "${port}" "${status}" "${data_dir}" "${config_file}" "${service_unit}" "${bin_dir}" "${socket_dir}" "pg_lsclusters" "${pid}")")
+  done < <(printf '%s\n' "${raw_output}" | awk 'NR > 1 { print $1 "|" $2 "|" $3 "|" $4 "|" $6 }')
+
+  [[ "${#POSTGRES_DISCOVERY_CANDIDATES[@]}" -gt 0 ]]
+}
+
+collect_generic_postgres_candidates() {
+  local ps_output=""
+  local line=""
+  local pid=""
+  local args=""
+  local data_dir=""
+  local version=""
+  local port=""
+  local socket_dir=""
+  local config_file=""
+  local bin_dir=""
+  local service_unit=""
+  local seen=" "
+
+  POSTGRES_DISCOVERY_CANDIDATES=()
+  have_cmd ps || return 1
+  ps_output="$(ps -eo pid=,args= 2>/dev/null || true)"
+  [[ -n "${ps_output}" ]] || return 1
+
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    pid="$(printf '%s\n' "${line}" | awk '{print $1}')"
+    args="${line#${pid}}"
+    args="${args# }"
+
+    [[ "${args}" == *"postgres:"* ]] && continue
+    [[ "${args}" == *"postmaster:"* ]] && continue
+    [[ "${args}" == *" -D "* ]] || continue
+    if [[ "${args}" =~ (^|[[:space:]])-D[[:space:]]+([^[:space:]]+) ]]; then
+      data_dir="${BASH_REMATCH[2]}"
+    else
+      continue
+    fi
+    [[ -f "${data_dir}/postmaster.pid" ]] || continue
+    if [[ "${seen}" == *" ${data_dir} "* ]]; then
+      continue
+    fi
+    seen="${seen}${data_dir} "
+
+    version="$(postgres_version_from_data_dir "${data_dir}" || true)"
+    port="$(postgres_port_from_pid_file "${data_dir}" || true)"
+    socket_dir="$(postgres_socket_dir_from_pid_file "${data_dir}" || true)"
+    if [[ "${args}" =~ config_file=([^[:space:]]+) ]]; then
+      config_file="${BASH_REMATCH[1]}"
+    else
+      config_file=""
+    fi
+    bin_dir="$(postgres_bin_dir_for_version "${version}" || true)"
+    service_unit="$(detect_postgres_service_unit_for_pid "${pid}" || true)"
+
+    POSTGRES_DISCOVERY_CANDIDATES+=("$(build_postgres_candidate "${version}" "" "${port}" "online" "${data_dir}" "${config_file}" "${service_unit}" "${bin_dir}" "${socket_dir}" "postmaster.pid" "${pid}")")
+  done <<< "${ps_output}"
+
+  [[ "${#POSTGRES_DISCOVERY_CANDIDATES[@]}" -gt 0 ]]
+}
+
+select_local_postgres_candidate() {
+  local record=""
+  local matches=()
+  local version=""
+  local cluster=""
+  local port=""
+  local status=""
+  local data_dir=""
+  local config_file=""
+  local service_unit=""
+  local bin_dir=""
+  local socket_dir=""
+  local source=""
+  local pid=""
+  local match_score=0
+  local best_score=0
+  local best_record=""
+  local best_version=-1
+  local best_version_matches=()
+
+  if [[ "${ENV_FILE_ALREADY_PRESENT}" == "true" ]] && is_local_db_host "${DB_HOST}" && [[ "${DB_PORT}" =~ ^[0-9]+$ ]]; then
+    for record in "${POSTGRES_DISCOVERY_CANDIDATES[@]}"; do
+      IFS='|' read -r version cluster port status data_dir config_file service_unit bin_dir socket_dir source pid <<< "${record}"
+      if [[ "${port}" == "${DB_PORT}" ]]; then
+        matches+=("${record}")
+      fi
+    done
+    if [[ "${#matches[@]}" -eq 1 ]]; then
+      POSTGRES_SELECTION_SOURCE="existing env port"
+      POSTGRES_SELECTED_RECORD="${matches[0]}"
+      return 0
+    elif [[ "${#matches[@]}" -gt 1 ]]; then
+      postgres_die_ambiguous_candidates "Multiple live PostgreSQL targets match existing env port ${DB_PORT}." "${matches[@]}"
+    fi
+  fi
+
+  matches=()
+  for record in "${POSTGRES_DISCOVERY_CANDIDATES[@]}"; do
+    match_score="$(postgres_candidate_match_score "${record}" || true)"
+    match_score="${match_score:-0}"
+    if (( match_score > best_score )); then
+      best_score="${match_score}"
+      best_record="${record}"
+      matches=("${record}")
+    elif (( match_score == best_score && match_score > 0 )); then
+      matches+=("${record}")
+    fi
+  done
+  if (( best_score > 0 )); then
+    if [[ "${#matches[@]}" -eq 1 ]]; then
+      POSTGRES_SELECTION_SOURCE="existing Maxogram role/database"
+      POSTGRES_SELECTED_RECORD="${best_record}"
+      return 0
+    fi
+    postgres_die_ambiguous_candidates "Multiple live PostgreSQL targets already contain Maxogram role/database state." "${matches[@]}"
+  fi
+
+  for record in "${POSTGRES_DISCOVERY_CANDIDATES[@]}"; do
+    IFS='|' read -r version cluster port status data_dir config_file service_unit bin_dir socket_dir source pid <<< "${record}"
+    version="${version:-0}"
+    if (( version > best_version )); then
+      best_version="${version}"
+      best_version_matches=("${record}")
+    elif (( version == best_version )); then
+      best_version_matches+=("${record}")
+    fi
+  done
+
+  if [[ "${#best_version_matches[@]}" -eq 1 ]]; then
+    POSTGRES_SELECTION_SOURCE="highest live major version"
+    POSTGRES_SELECTED_RECORD="${best_version_matches[0]}"
+    return 0
+  fi
+
+  postgres_die_ambiguous_candidates "Multiple live PostgreSQL targets share the highest major version ${best_version}." "${best_version_matches[@]}"
+}
+
+attempt_start_highest_debian_cluster() {
+  local record=""
+  local version=""
+  local cluster=""
+  local port=""
+  local status=""
+  local data_dir=""
+  local config_file=""
+  local service_unit=""
+  local bin_dir=""
+  local socket_dir=""
+  local source=""
+  local pid=""
+  local best_version=-1
+  local matches=()
+
+  collect_debian_pg_lsclusters_candidates "all" || return 1
+
+  for record in "${POSTGRES_DISCOVERY_CANDIDATES[@]}"; do
+    IFS='|' read -r version cluster port status data_dir config_file service_unit bin_dir socket_dir source pid <<< "${record}"
+    version="${version:-0}"
+    if (( version > best_version )); then
+      best_version="${version}"
+      matches=("${record}")
+    elif (( version == best_version )); then
+      matches+=("${record}")
+    fi
+  done
+
+  if [[ "${#matches[@]}" -gt 1 ]]; then
+    postgres_die_ambiguous_candidates "No PostgreSQL clusters are online, and multiple offline clusters share the highest major version ${best_version}." "${matches[@]}"
+  fi
+
+  record="${matches[0]}"
+  IFS='|' read -r version cluster port status data_dir config_file service_unit bin_dir socket_dir source pid <<< "${record}"
+  [[ -n "${service_unit}" ]] || die "Could not determine a cluster-specific systemd unit for PostgreSQL ${version}/${cluster}."
+
+  log "No PostgreSQL clusters are online; trying to start ${service_unit}."
+  service_enable_now_candidates "${service_unit}" >/dev/null || die "Could not start PostgreSQL cluster ${version}/${cluster} automatically."
+}
+
+finalize_local_postgres_target() {
+  local record="$1"
+  local version cluster port status data_dir config_file service_unit bin_dir socket_dir source pid
+  local detected_config=""
+  local detected_data_dir=""
+  local detected_port=""
+  local log_label=""
+
+  IFS='|' read -r version cluster port status data_dir config_file service_unit bin_dir socket_dir source pid <<< "${record}"
+
+  POSTGRES_MAJOR_VERSION="${version}"
+  POSTGRES_CLUSTER_NAME="${cluster}"
+  POSTGRES_SERVICE_UNIT="${service_unit}"
+  POSTGRES_BIN_DIR="${bin_dir}"
+  POSTGRES_DATA_DIR="${data_dir}"
+  POSTGRES_CONFIG_FILE="${config_file}"
+  POSTGRES_SOCKET_DIR="${socket_dir}"
+  POSTGRES_PORT="${port}"
+  POSTGRES_SELECTION_SOURCE="${POSTGRES_SELECTION_SOURCE} via ${source}"
+
+  refresh_postgres_binaries
+  [[ -n "${PSQL_BIN}" ]] || die "Could not locate psql for the selected PostgreSQL target."
+  [[ -n "${CREATEDB_BIN}" ]] || die "Could not locate createdb for the selected PostgreSQL target."
+  POSTGRES_BIN_DIR="$(dirname "${PSQL_BIN}")"
+
+  if [[ "${DISTRO_FAMILY}" == "debian" ]]; then
+    [[ -n "${bin_dir}" ]] || die "Could not locate version-specific PostgreSQL binaries for cluster ${version}/${cluster}."
+    [[ "${PSQL_BIN}" == "${bin_dir}/psql" ]] || die "Refusing to use pg_wrapper for cluster ${version}/${cluster}; version-specific psql is required."
+    [[ "${CREATEDB_BIN}" == "${bin_dir}/createdb" ]] || die "Refusing to use pg_wrapper for cluster ${version}/${cluster}; version-specific createdb is required."
+  fi
+
+  [[ -n "${POSTGRES_SOCKET_DIR}" ]] || die "Could not determine the Unix socket directory for the selected PostgreSQL target."
+  [[ -n "${POSTGRES_PORT}" ]] || die "Could not determine the port for the selected PostgreSQL target."
+
+  detected_config="$(selected_postgres_query_line "SHOW config_file;" || true)"
+  if [[ -n "${detected_config}" ]]; then
+    POSTGRES_CONFIG_FILE="${detected_config}"
+  fi
+  [[ -n "${POSTGRES_CONFIG_FILE}" && -f "${POSTGRES_CONFIG_FILE}" ]] || die "Could not locate postgresql.conf for the selected PostgreSQL target."
+
+  detected_data_dir="$(selected_postgres_query_line "SHOW data_directory;" || true)"
+  if [[ -n "${detected_data_dir}" ]]; then
+    POSTGRES_DATA_DIR="${detected_data_dir}"
+  fi
+  [[ -n "${POSTGRES_DATA_DIR}" ]] || die "Could not determine the data directory for the selected PostgreSQL target."
+
+  detected_port="$(selected_postgres_query_scalar "SHOW port;" || true)"
+  [[ -n "${detected_port}" ]] || die "Could not determine the port for the selected PostgreSQL target."
+  POSTGRES_PORT="${detected_port}"
+
+  if [[ -z "${POSTGRES_SOCKET_DIR}" ]]; then
+    POSTGRES_SOCKET_DIR="$(postgres_socket_dir_from_pid_file "${POSTGRES_DATA_DIR}" || true)"
+  fi
+  [[ -n "${POSTGRES_SOCKET_DIR}" ]] || die "Could not determine the Unix socket directory for the selected PostgreSQL target."
+
+  if [[ -n "${POSTGRES_CLUSTER_NAME}" ]]; then
+    log_label="cluster ${POSTGRES_MAJOR_VERSION}/${POSTGRES_CLUSTER_NAME}"
+  else
+    log_label="instance ${POSTGRES_DATA_DIR}"
+  fi
+  log "Selected PostgreSQL ${log_label} on ${POSTGRES_PORT} via ${POSTGRES_SELECTION_SOURCE}."
+}
+
+resolve_local_postgres_target() {
+  local selected_record=""
+
+  reset_local_postgres_target
+
+  if [[ "${DISTRO_FAMILY}" == "debian" ]] && have_cmd pg_lsclusters; then
+    collect_debian_pg_lsclusters_candidates "online" || true
+    if [[ "${#POSTGRES_DISCOVERY_CANDIDATES[@]}" -eq 0 ]]; then
+      attempt_start_highest_debian_cluster || true
+      collect_debian_pg_lsclusters_candidates "online" || true
+    fi
+  else
+    collect_generic_postgres_candidates || true
+  fi
+
+  if [[ "${#POSTGRES_DISCOVERY_CANDIDATES[@]}" -eq 0 ]]; then
+    die "Could not discover a live local PostgreSQL target. Start PostgreSQL manually and rerun the installer."
+  fi
+
+  select_local_postgres_candidate
+  selected_record="${POSTGRES_SELECTED_RECORD}"
+  [[ -n "${selected_record}" ]] || die "Could not select a local PostgreSQL target."
+  finalize_local_postgres_target "${selected_record}"
 }
 
 initialize_postgres_cluster_if_needed() {
@@ -579,45 +1127,58 @@ ensure_postgres_installed() {
 
   if POSTGRES_SERVICE_UNIT="$(service_enable_now_candidates "${POSTGRES_SERVICE_CANDIDATES[@]}")"; then
     log "Using PostgreSQL service ${POSTGRES_SERVICE_UNIT}."
-  elif ! run_as_postgres "${PSQL_BIN}" -d postgres -tAc "SELECT 1" >/dev/null 2>&1; then
-    die "Could not start PostgreSQL automatically. Start it manually and rerun the installer."
   else
-    warn "PostgreSQL service name could not be detected, but the server is already responding."
+    warn "PostgreSQL service name could not be detected automatically; continuing with live target discovery."
   fi
 }
 
 detect_postgres_port() {
-  run_as_postgres "${PSQL_BIN}" -d postgres -tAc "SHOW port;" | tr -d '[:space:]'
+  [[ -n "${POSTGRES_PORT}" ]] || die "Local PostgreSQL target was not resolved."
+  printf '%s\n' "${POSTGRES_PORT}"
 }
 
 detect_postgres_file() {
   local setting="$1"
-  run_as_postgres "${PSQL_BIN}" -d postgres -tAc "SHOW ${setting};" | tr -d '[:space:]'
+  [[ "${setting}" =~ ^[a-z_]+$ ]] || die "Invalid PostgreSQL setting name: ${setting}"
+
+  if [[ "${setting}" == "config_file" && -n "${POSTGRES_CONFIG_FILE}" ]]; then
+    printf '%s\n' "${POSTGRES_CONFIG_FILE}"
+    return 0
+  fi
+
+  selected_postgres_query_line "SHOW ${setting};"
 }
 
 set_postgres_port() {
   local desired_port="$1"
   local current_port="$2"
+  local current_target_key=""
 
   if [[ -z "${desired_port}" || "${desired_port}" == "${current_port}" ]]; then
     return 0
   fi
 
   [[ "${desired_port}" =~ ^[0-9]+$ ]] || die "PostgreSQL port must be an integer."
+  [[ -n "${POSTGRES_CONFIG_FILE}" && -f "${POSTGRES_CONFIG_FILE}" ]] || die "Cannot locate postgresql.conf for the selected PostgreSQL target."
+  [[ -n "${POSTGRES_SERVICE_UNIT}" ]] || die "Cannot restart PostgreSQL because the selected service unit is unknown."
 
-  local config_file
-  config_file="$(detect_postgres_file "config_file" || true)"
-  [[ -n "${config_file}" && -f "${config_file}" ]] || die "Cannot locate postgresql.conf."
+  current_target_key="${POSTGRES_MAJOR_VERSION}|${POSTGRES_CLUSTER_NAME}|${POSTGRES_DATA_DIR}"
 
   log "Changing PostgreSQL port from ${current_port} to ${desired_port}..."
-  if grep -Eq '^[[:space:]]*#?[[:space:]]*port[[:space:]]*=' "${config_file}"; then
-    sed -Ei "s|^[[:space:]]*#?[[:space:]]*port[[:space:]]*=.*$|port = ${desired_port}|" "${config_file}"
+  if grep -Eq '^[[:space:]]*#?[[:space:]]*port[[:space:]]*=' "${POSTGRES_CONFIG_FILE}"; then
+    sed -Ei "s|^[[:space:]]*#?[[:space:]]*port[[:space:]]*=.*$|port = ${desired_port}|" "${POSTGRES_CONFIG_FILE}"
   else
-    printf '\nport = %s\n' "${desired_port}" >> "${config_file}"
+    printf '\nport = %s\n' "${desired_port}" >> "${POSTGRES_CONFIG_FILE}"
   fi
 
-  if [[ -n "${POSTGRES_SERVICE_UNIT}" ]]; then
-    service_restart_candidates "${POSTGRES_SERVICE_UNIT}" >/dev/null || die "Failed to restart PostgreSQL after changing the port."
+  service_restart_candidates "${POSTGRES_SERVICE_UNIT}" >/dev/null || die "Failed to restart PostgreSQL after changing the port."
+  resolve_local_postgres_target
+
+  if [[ "${POSTGRES_MAJOR_VERSION}|${POSTGRES_CLUSTER_NAME}|${POSTGRES_DATA_DIR}" != "${current_target_key}" ]]; then
+    die "PostgreSQL restart selected a different local target after the port change."
+  fi
+  if [[ "${POSTGRES_PORT}" != "${desired_port}" ]]; then
+    die "PostgreSQL port change did not take effect; expected ${desired_port}, got ${POSTGRES_PORT}."
   fi
 }
 
@@ -702,12 +1263,13 @@ require_non_empty_runtime_values() {
 local_postgres_role_exists() {
   local role_name="$1"
   [[ -n "${PSQL_BIN}" ]] || return 1
-  [[ "$(run_as_postgres "${PSQL_BIN}" -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$(escape_sql_literal "${role_name}")';" | tr -d '[:space:]')" == "1" ]]
+  [[ "$(selected_postgres_query_scalar "SELECT 1 FROM pg_roles WHERE rolname='$(escape_sql_literal "${role_name}")';")" == "1" ]]
 }
 
 prepare_local_postgres_context() {
   LOCAL_DB_TARGET="true"
   ensure_postgres_installed
+  resolve_local_postgres_target
 
   local detected_port
   detected_port="$(detect_postgres_port || true)"
@@ -981,26 +1543,29 @@ ensure_database_role_and_db() {
   escaped_password="$(escape_sql_literal "${DB_PASSWORD}")"
 
   local role_exists
-  role_exists="$(run_as_postgres "${PSQL_BIN}" -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='$(escape_sql_literal "${DB_USER}")';" | tr -d '[:space:]')"
+  role_exists="$(selected_postgres_query_scalar "SELECT 1 FROM pg_roles WHERE rolname='$(escape_sql_literal "${DB_USER}")';" || true)"
   if [[ "${role_exists}" == "1" ]]; then
     if [[ "${UPDATE_ROLE_PASSWORD}" == "true" ]]; then
       log "Updating password for existing PostgreSQL role ${DB_USER}..."
-      run_as_postgres "${PSQL_BIN}" -v ON_ERROR_STOP=1 -d postgres -c \
+      run_as_postgres env PGHOST="${POSTGRES_SOCKET_DIR}" PGPORT="${POSTGRES_PORT}" \
+        "${PSQL_BIN}" -X -v ON_ERROR_STOP=1 -h "${POSTGRES_SOCKET_DIR}" -p "${POSTGRES_PORT}" -d postgres -c \
         "ALTER ROLE \"${DB_USER}\" LOGIN PASSWORD '${escaped_password}';"
     else
       log "Reusing existing PostgreSQL role ${DB_USER}."
     fi
   else
     log "Creating PostgreSQL role ${DB_USER}..."
-    run_as_postgres "${PSQL_BIN}" -v ON_ERROR_STOP=1 -d postgres -c \
+    run_as_postgres env PGHOST="${POSTGRES_SOCKET_DIR}" PGPORT="${POSTGRES_PORT}" \
+      "${PSQL_BIN}" -X -v ON_ERROR_STOP=1 -h "${POSTGRES_SOCKET_DIR}" -p "${POSTGRES_PORT}" -d postgres -c \
       "CREATE ROLE \"${DB_USER}\" LOGIN PASSWORD '${escaped_password}';"
   fi
 
   local db_exists
-  db_exists="$(run_as_postgres "${PSQL_BIN}" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='$(escape_sql_literal "${DB_NAME}")';" | tr -d '[:space:]')"
+  db_exists="$(selected_postgres_query_scalar "SELECT 1 FROM pg_database WHERE datname='$(escape_sql_literal "${DB_NAME}")';" || true)"
   if [[ "${db_exists}" != "1" ]]; then
     log "Creating PostgreSQL database ${DB_NAME}..."
-    run_as_postgres "${CREATEDB_BIN}" -O "${DB_USER}" "${DB_NAME}"
+    run_as_postgres env PGHOST="${POSTGRES_SOCKET_DIR}" PGPORT="${POSTGRES_PORT}" \
+      "${CREATEDB_BIN}" -h "${POSTGRES_SOCKET_DIR}" -p "${POSTGRES_PORT}" -O "${DB_USER}" "${DB_NAME}"
   else
     log "Reusing existing PostgreSQL database ${DB_NAME}."
   fi
@@ -1015,7 +1580,8 @@ create_schema_and_search_path() {
     -d "${DB_NAME}" \
     -c "CREATE SCHEMA IF NOT EXISTS \"${DB_SCHEMA}\" AUTHORIZATION \"${DB_USER}\";"
 
-  run_as_postgres "${PSQL_BIN}" -v ON_ERROR_STOP=1 -d postgres -c \
+  run_as_postgres env PGHOST="${POSTGRES_SOCKET_DIR}" PGPORT="${POSTGRES_PORT}" \
+    "${PSQL_BIN}" -X -v ON_ERROR_STOP=1 -h "${POSTGRES_SOCKET_DIR}" -p "${POSTGRES_PORT}" -d postgres -c \
     "ALTER ROLE \"${DB_USER}\" IN DATABASE \"${DB_NAME}\" SET search_path TO \"${DB_SCHEMA}\", public;"
 }
 
@@ -1266,4 +1832,6 @@ Useful commands:
 EOF
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

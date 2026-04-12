@@ -24,6 +24,10 @@ def test_readme_uses_public_installer_url_and_modes() -> None:
     assert "listen_addresses" in readme
     assert "pg_hba.conf" in readme
     assert "firewall" in readme
+    assert "detected selected local PostgreSQL instance port" in readme
+    assert "existing local Maxogram env port match" in readme
+    assert "highest live major version" in readme
+    assert "explicit ambiguity error" in readme
 
 
 def test_install_script_uses_real_cli_and_tarball_update_flow() -> None:
@@ -55,3 +59,7 @@ def test_install_script_uses_real_cli_and_tarball_update_flow() -> None:
     assert "git fetch" not in installer
     assert "pg_hba.conf" not in installer
     assert "listen_addresses" not in installer
+    assert "resolve_local_postgres_target" in installer
+    assert "pg_lsclusters" in installer
+    assert "postmaster.pid" in installer
+    assert "Could not discover a live local PostgreSQL target" in installer

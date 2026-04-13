@@ -5,8 +5,20 @@ services:
     restart: unless-stopped
     env_file:
       - /etc/maxogram/maxogram.env
+
     # The installer writes /etc/maxogram/maxogram.env.
     # Change this path only for a manual deployment flow.
+
+    # For a local PostgreSQL server running on the Docker host, use both blocks below.
+    # The installer enables them automatically when MAXOGRAM_DB_HOST points to a local host,
+    # loopback address, or Unix socket path.
+    #
+    # environment:
+    #   MAXOGRAM_DB_HOST: host.docker.internal
+    #
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+
     # No ports are required unless a future HTTP endpoint is added.
     # ports:
     #   - "8000:8000"

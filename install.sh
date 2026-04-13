@@ -531,6 +531,19 @@ is_local_db_host() {
   esac
 }
 
+
+docker_runtime_db_host() {
+  if is_local_db_host "${DB_HOST}" || [[ "${DB_HOST}" == "host.docker.internal" ]]; then
+    printf '%s\n' "host.docker.internal"
+  else
+    printf '%s\n' "${DB_HOST}"
+  fi
+}
+
+docker_needs_host_gateway_mapping() {
+  [[ "$(docker_runtime_db_host)" == "host.docker.internal" ]]
+}
+
 ensure_base_packages() {
   if [[ "${#BASE_PACKAGE_GROUPS[@]}" -eq 0 ]]; then
     warn "No known base-package set for this distro. Continuing with whatever tools are already installed."
@@ -1416,6 +1429,9 @@ ensure_deploy_dir() {
 write_compose_file() {
   ensure_deploy_dir
 
+  local runtime_db_host=""
+  runtime_db_host="$(docker_runtime_db_host)"
+
   cat > "${COMPOSE_FILE}" <<EOF
 services:
   ${APP_NAME}:
@@ -1424,7 +1440,17 @@ services:
     restart: unless-stopped
     env_file:
       - ${ENV_FILE}
+    environment:
+      MAXOGRAM_DB_HOST: ${runtime_db_host}
 EOF
+
+  if docker_needs_host_gateway_mapping; then
+    cat >> "${COMPOSE_FILE}" <<'EOF'
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+EOF
+  fi
+
   chmod 644 "${COMPOSE_FILE}"
 }
 
@@ -1433,8 +1459,18 @@ docker_compose_cmd() {
 }
 
 docker_run_maxogram_cli() {
+  local runtime_db_host=""
+  local add_host_flag=()
+
+  runtime_db_host="$(docker_runtime_db_host)"
+  if docker_needs_host_gateway_mapping; then
+    add_host_flag=(--add-host "host.docker.internal:host-gateway")
+  fi
+
   docker run --rm \
+    "${add_host_flag[@]}" \
     --env-file "${ENV_FILE}" \
+    -e "MAXOGRAM_DB_HOST=${runtime_db_host}" \
     --entrypoint python \
     "${DOCKER_IMAGE}" \
     -m maxogram --root /app "$@"
@@ -1616,18 +1652,22 @@ main() {
   remove_legacy_host_artifacts
   deploy_container
 
+  local runtime_db_host=""
+  runtime_db_host="$(docker_runtime_db_host)"
+
   cat <<EOF
 
 Installation complete.
 
-Mode:            ${MODE}
-Image:           ${DOCKER_IMAGE}
+Mode:             ${MODE}
+Image:            ${DOCKER_IMAGE}
 Deploy directory: ${APP_DIR}
-Compose file:    ${COMPOSE_FILE}
-Config file:     ${ENV_FILE}
-Database:        ${DB_NAME} on ${DB_HOST}:${DB_PORT}
-Schema:          ${DB_SCHEMA}
-Restart policy:  unless-stopped
+Compose file:     ${COMPOSE_FILE}
+Config file:      ${ENV_FILE}
+Database:         ${DB_NAME} on ${DB_HOST}:${DB_PORT}
+Runtime DB host:  ${runtime_db_host}
+Schema:           ${DB_SCHEMA}
+Restart policy:   unless-stopped
 
 Useful commands:
   docker compose -f ${COMPOSE_FILE} ps

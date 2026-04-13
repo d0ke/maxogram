@@ -27,10 +27,12 @@ Production deployment is Docker-first:
 
 ## One-Line Install
 
+These commands download the installer to `/tmp` first and then run it locally, so interactive prompts work reliably.
+
 ### Auto Mode
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/d0ke/maxogram/main/install.sh | sudo bash -s -- auto
+curl -fsSLo /tmp/maxogram-install.sh https://raw.githubusercontent.com/d0ke/maxogram/main/install.sh && chmod +x /tmp/maxogram-install.sh && sudo /tmp/maxogram-install.sh auto
 ```
 
 Auto mode:
@@ -53,7 +55,7 @@ Auto defaults:
 ### Manual Mode
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/d0ke/maxogram/main/install.sh | sudo bash -s -- manual
+curl -fsSLo /tmp/maxogram-install.sh https://raw.githubusercontent.com/d0ke/maxogram/main/install.sh && chmod +x /tmp/maxogram-install.sh && sudo /tmp/maxogram-install.sh manual
 ```
 
 Manual mode asks:
@@ -74,7 +76,7 @@ For a remote PostgreSQL host, the installer skips local PostgreSQL installation 
 ### Update Mode
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/d0ke/maxogram/main/install.sh | sudo bash -s -- update
+curl -fsSLo /tmp/maxogram-install.sh https://raw.githubusercontent.com/d0ke/maxogram/main/install.sh && chmod +x /tmp/maxogram-install.sh && sudo /tmp/maxogram-install.sh update
 ```
 
 Update mode:

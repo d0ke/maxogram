@@ -10,9 +10,13 @@ def test_readme_documents_docker_first_install_flow() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
     assert "https://raw.githubusercontent.com/d0ke/maxogram/main/install.sh" in readme
-    assert "sudo bash -s -- auto" in readme
-    assert "sudo bash -s -- manual" in readme
-    assert "sudo bash -s -- update" in readme
+    assert "curl -fsSLo /tmp/maxogram-install.sh" in readme
+    assert "sudo /tmp/maxogram-install.sh auto" in readme
+    assert "sudo /tmp/maxogram-install.sh manual" in readme
+    assert "sudo /tmp/maxogram-install.sh update" in readme
+    assert "sudo bash -s -- auto" not in readme
+    assert "sudo bash -s -- manual" not in readme
+    assert "sudo bash -s -- update" not in readme
     assert "docker.io/d0ke/maxogram:latest" in readme
     assert "/etc/maxogram/maxogram.env" in readme
     assert "/opt/maxogram/docker-compose.app.yml" in readme

@@ -1225,9 +1225,39 @@ prompt_secret() {
   printf -v "${__var_name}" '%s' "${input}"
 }
 
+prompt_secret_or_generate() {
+  local __var_name="$1"
+  local prompt_text="$2"
+  local generated_log_message="$3"
+  local current_value
+  current_value="${!__var_name:-}"
+
+  local prompt_suffix=""
+  if [[ -n "${current_value}" ]]; then
+    prompt_suffix=" [press Enter to keep current value]"
+  else
+    prompt_suffix=" [press Enter to auto-generate]"
+  fi
+
+  local input=""
+  read -r -s -p "${prompt_text}${prompt_suffix}: " input
+  printf '\n'
+  if [[ -z "${input}" ]]; then
+    if [[ -n "${current_value}" ]]; then
+      input="${current_value}"
+    else
+      input="$(generate_password)"
+      if [[ -n "${generated_log_message}" ]]; then
+        log "${generated_log_message}"
+      fi
+    fi
+  fi
+  printf -v "${__var_name}" '%s' "${input}"
+}
+
 generate_password() {
   if have_cmd openssl; then
-    openssl rand -base64 24 | tr -dc 'A-Za-z0-9._-!' | head -c 32
+    openssl rand -base64 24 | tr -dc 'A-Za-z0-9._!-' | head -c 32
   else
     date +%s | sha256sum | cut -c1-32
   fi
@@ -1264,8 +1294,13 @@ prepare_local_postgres_context() {
 }
 
 collect_auto_inputs() {
+  local existing_local_role="false"
+
   if is_local_db_host "${DB_HOST}"; then
     prepare_local_postgres_context
+    if [[ "${ENV_FILE_ALREADY_PRESENT}" != "true" ]] && local_postgres_role_exists "${DB_USER}"; then
+      existing_local_role="true"
+    fi
   fi
 
   prompt_secret TG_BOT_TOKEN "Telegram bot token"
@@ -1274,14 +1309,16 @@ collect_auto_inputs() {
   prompt_secret MAX_BOT_TOKEN "MAX bot token"
   [[ -n "${MAX_BOT_TOKEN}" ]] || die "MAX bot token is required."
 
-  if [[ "${LOCAL_DB_TARGET}" == "true" && "${ENV_FILE_ALREADY_PRESENT}" != "true" ]] && local_postgres_role_exists "${DB_USER}"; then
-    prompt_secret DB_PASSWORD "Database password for existing role ${DB_USER}"
-    [[ -n "${DB_PASSWORD}" ]] || die "Database password is required to reuse existing role ${DB_USER}."
-    UPDATE_ROLE_PASSWORD="false"
-  elif [[ -z "${DB_PASSWORD}" ]]; then
-    DB_PASSWORD="$(generate_password)"
-    log "Generated database password for ${DB_USER}."
-    UPDATE_ROLE_PASSWORD="false"
+  if [[ "${existing_local_role}" == "true" ]]; then
+    prompt_secret_or_generate DB_PASSWORD "Database password for role ${DB_USER}" "Generated database password for ${DB_USER}."
+    UPDATE_ROLE_PASSWORD="true"
+  else
+    prompt_secret_or_generate DB_PASSWORD "Database password" "Generated database password for ${DB_USER}."
+    if [[ "${LOCAL_DB_TARGET}" == "true" ]]; then
+      UPDATE_ROLE_PASSWORD="true"
+    else
+      UPDATE_ROLE_PASSWORD="false"
+    fi
   fi
 }
 

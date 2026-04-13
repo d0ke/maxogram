@@ -2,25 +2,15 @@
 set -euo pipefail
 
 APP_NAME="maxogram"
-APP_USER="maxogram"
-APP_GROUP="maxogram"
-APP_HOME="/var/lib/maxogram"
 APP_DIR="/opt/maxogram"
 ENV_DIR="/etc/maxogram"
 ENV_FILE="${ENV_DIR}/maxogram.env"
-SYSTEMD_UNIT="/etc/systemd/system/maxogram.service"
-CRON_FILE="/etc/cron.d/maxogram-restart"
-RESTART_TIMER_SERVICE="/etc/systemd/system/maxogram-restart.service"
-RESTART_TIMER_UNIT="/etc/systemd/system/maxogram-restart.timer"
-
-APP_SOURCE_URL="https://codeload.github.com/d0ke/maxogram/tar.gz/refs/heads/main"
-APP_SOURCE_LABEL="GitHub tarball (main)"
-
-PYTHON_FALLBACK_VERSION="3.13.0"
-PYTHON_EXEC=""
-PYTHON_VENV_READY="false"
-PYTHON_MIN_MAJOR="3"
-PYTHON_MIN_MINOR="13"
+COMPOSE_FILE="${APP_DIR}/docker-compose.app.yml"
+DOCKER_IMAGE="${DOCKER_IMAGE:-docker.io/d0ke/maxogram:latest}"
+LEGACY_SYSTEMD_UNIT="/etc/systemd/system/maxogram.service"
+LEGACY_CRON_FILE="/etc/cron.d/maxogram-restart"
+LEGACY_RESTART_TIMER_SERVICE="/etc/systemd/system/maxogram-restart.service"
+LEGACY_RESTART_TIMER_UNIT="/etc/systemd/system/maxogram-restart.timer"
 
 DEFAULT_DB_HOST="127.0.0.1"
 DEFAULT_DB_PORT="5432"
@@ -39,19 +29,14 @@ PACKAGES_REFRESHED="false"
 
 BASE_PACKAGE_GROUPS=()
 POSTGRES_PACKAGE_GROUPS=()
-CRON_PACKAGE_GROUPS=()
-PYTHON_PACKAGE_GROUPS=()
-BUILD_DEP_PACKAGE_GROUPS=()
+DOCKER_PACKAGE_GROUPS=()
 POSTGRES_SERVICE_CANDIDATES=()
-CRON_SERVICE_CANDIDATES=()
-PYTHON_COMMAND_CANDIDATES=()
+DOCKER_SERVICE_CANDIDATES=()
 
 POSTGRES_SERVICE_UNIT=""
-CRON_SERVICE_UNIT=""
-WATCHDOG_MODE="none"
+DOCKER_SERVICE_UNIT=""
 POSTGRES_DEFAULT_DATA_DIR=""
 SYSTEMCTL_BIN=""
-NOLOGIN_SHELL=""
 PSQL_BIN=""
 CREATEDB_BIN=""
 POSTGRES_MAJOR_VERSION=""
@@ -104,9 +89,11 @@ Usage:
 Modes:
   auto   Ask Telegram and MAX bot tokens. If an existing local maxogram_app role
          is found and no env file exists yet, ask for that database password too.
+         Existing env values stay available with "press Enter to keep current value".
   manual Ask tokens plus database host, port, name, user, password, and schema.
-  update Reuse /etc/maxogram/maxogram.env, refresh code and dependencies, run
-         check-config + db-upgrade, then restart the service.
+         Existing env values stay available with "press Enter to keep current value".
+  update Reuse /etc/maxogram/maxogram.env, pull the latest Docker image, run
+         in-container check-config + db-upgrade, then recreate the container.
 
 Supported install paths:
   - Debian and Ubuntu
@@ -129,21 +116,9 @@ require_root() {
 
 ensure_systemd_available() {
   if ! have_cmd systemctl; then
-    die "systemctl is required because this installer manages systemd services and timers."
+    die "systemctl is required because this installer manages Docker and PostgreSQL services."
   fi
   SYSTEMCTL_BIN="$(command -v systemctl)"
-}
-
-detect_nologin_shell() {
-  if have_cmd nologin; then
-    NOLOGIN_SHELL="$(command -v nologin)"
-  elif [[ -x /usr/sbin/nologin ]]; then
-    NOLOGIN_SHELL="/usr/sbin/nologin"
-  elif [[ -x /sbin/nologin ]]; then
-    NOLOGIN_SHELL="/sbin/nologin"
-  else
-    NOLOGIN_SHELL="/bin/false"
-  fi
 }
 
 split_words() {
@@ -171,67 +146,44 @@ detect_package_manager_from_commands() {
 configure_package_manager() {
   BASE_PACKAGE_GROUPS=()
   POSTGRES_PACKAGE_GROUPS=()
-  CRON_PACKAGE_GROUPS=()
-  PYTHON_PACKAGE_GROUPS=()
-  BUILD_DEP_PACKAGE_GROUPS=()
+  DOCKER_PACKAGE_GROUPS=()
   POSTGRES_SERVICE_CANDIDATES=("postgresql" "postgresql.service")
-  CRON_SERVICE_CANDIDATES=("cron" "cron.service" "crond" "crond.service" "cronie" "cronie.service")
-  PYTHON_COMMAND_CANDIDATES=("python3.13" "python3" "python")
+  DOCKER_SERVICE_CANDIDATES=("docker" "docker.service")
   POSTGRES_DEFAULT_DATA_DIR=""
 
   case "${PKG_MANAGER}" in
     apt)
       BASE_PACKAGE_GROUPS=("ca-certificates coreutils curl grep sed gawk procps tar")
       POSTGRES_PACKAGE_GROUPS=("postgresql postgresql-client postgresql-contrib")
-      CRON_PACKAGE_GROUPS=("cron")
-      PYTHON_PACKAGE_GROUPS=("python3.13 python3.13-venv python3.13-dev")
-      BUILD_DEP_PACKAGE_GROUPS=("build-essential libbz2-dev libffi-dev libgdbm-dev liblzma-dev libncursesw5-dev libreadline-dev libsqlite3-dev libssl-dev tk-dev uuid-dev xz-utils zlib1g-dev")
+      DOCKER_PACKAGE_GROUPS=("docker.io docker-compose-v2" "docker.io docker-compose-plugin" "docker.io")
       POSTGRES_SERVICE_CANDIDATES=("postgresql" "postgresql.service")
-      CRON_SERVICE_CANDIDATES=("cron" "cron.service")
-      PYTHON_COMMAND_CANDIDATES=("python3.13" "python3")
       ;;
     dnf)
       BASE_PACKAGE_GROUPS=("ca-certificates coreutils curl grep sed gawk procps-ng tar")
       POSTGRES_PACKAGE_GROUPS=("postgresql-server postgresql postgresql-contrib")
-      CRON_PACKAGE_GROUPS=("cronie")
-      PYTHON_PACKAGE_GROUPS=("python3.13 python3.13-devel" "python3 python3-devel")
-      BUILD_DEP_PACKAGE_GROUPS=("bzip2-devel gcc gdbm-devel libffi-devel make ncurses-devel openssl-devel readline-devel sqlite-devel tk-devel xz-devel zlib-devel")
+      DOCKER_PACKAGE_GROUPS=("docker docker-compose-plugin" "moby-engine docker-compose-plugin" "docker")
       POSTGRES_SERVICE_CANDIDATES=("postgresql" "postgresql.service")
-      CRON_SERVICE_CANDIDATES=("crond" "crond.service" "cronie" "cronie.service")
-      PYTHON_COMMAND_CANDIDATES=("python3.13" "python3")
       POSTGRES_DEFAULT_DATA_DIR="/var/lib/pgsql/data"
       ;;
     zypper)
       BASE_PACKAGE_GROUPS=("ca-certificates coreutils curl grep sed gawk procps tar")
       POSTGRES_PACKAGE_GROUPS=("postgresql-server postgresql postgresql-contrib" "postgresql16-server postgresql16 postgresql16-contrib" "postgresql15-server postgresql15 postgresql15-contrib" "postgresql14-server postgresql14 postgresql14-contrib")
-      CRON_PACKAGE_GROUPS=("cron")
-      PYTHON_PACKAGE_GROUPS=("python313 python313-devel" "python3.13 python3.13-devel" "python3 python3-devel")
-      BUILD_DEP_PACKAGE_GROUPS=("gcc make libbz2-devel libffi-devel gdbm-devel liblzma-devel ncurses-devel readline-devel sqlite3-devel libopenssl-devel tk-devel xz zlib-devel")
+      DOCKER_PACKAGE_GROUPS=("docker docker-compose-switch" "docker docker-compose" "moby-engine docker-compose-switch" "moby-engine docker-compose")
       POSTGRES_SERVICE_CANDIDATES=("postgresql" "postgresql.service")
-      CRON_SERVICE_CANDIDATES=("cron" "cron.service")
-      PYTHON_COMMAND_CANDIDATES=("python3.13" "python3" "python")
       POSTGRES_DEFAULT_DATA_DIR="/var/lib/pgsql/data"
       ;;
     pacman)
       BASE_PACKAGE_GROUPS=("ca-certificates coreutils curl grep sed gawk procps-ng tar")
       POSTGRES_PACKAGE_GROUPS=("postgresql")
-      CRON_PACKAGE_GROUPS=("cronie")
-      PYTHON_PACKAGE_GROUPS=("python")
-      BUILD_DEP_PACKAGE_GROUPS=("base-devel bzip2 gdbm libffi ncurses openssl readline sqlite tk xz zlib")
+      DOCKER_PACKAGE_GROUPS=("docker docker-compose" "docker")
       POSTGRES_SERVICE_CANDIDATES=("postgresql" "postgresql.service")
-      CRON_SERVICE_CANDIDATES=("cronie" "cronie.service" "crond" "crond.service")
-      PYTHON_COMMAND_CANDIDATES=("python" "python3")
       POSTGRES_DEFAULT_DATA_DIR="/var/lib/postgres/data"
       ;;
     *)
       BASE_PACKAGE_GROUPS=()
       POSTGRES_PACKAGE_GROUPS=()
-      CRON_PACKAGE_GROUPS=()
-      PYTHON_PACKAGE_GROUPS=()
-      BUILD_DEP_PACKAGE_GROUPS=()
+      DOCKER_PACKAGE_GROUPS=("docker docker-compose-plugin" "docker.io docker-compose-plugin" "docker docker-compose" "docker.io")
       POSTGRES_SERVICE_CANDIDATES=("postgresql" "postgresql.service")
-      CRON_SERVICE_CANDIDATES=("cron" "cron.service" "crond" "crond.service" "cronie" "cronie.service")
-      PYTHON_COMMAND_CANDIDATES=("python3.13" "python3" "python")
       POSTGRES_DEFAULT_DATA_DIR=""
       ;;
   esac
@@ -540,10 +492,6 @@ run_as_postgres() {
   runuser -u postgres -- "$@"
 }
 
-run_as_app() {
-  runuser -u "${APP_USER}" -- "$@"
-}
-
 escape_sql_literal() {
   printf '%s' "$1" | sed "s/'/''/g"
 }
@@ -556,13 +504,16 @@ validate_env_value() {
   [[ "$1" != *$'\n'* ]] && [[ "$1" != *$'\r'* ]]
 }
 
-quote_env_value() {
+normalize_env_file_value() {
   local value="$1"
-  value="${value//\\/\\\\}"
-  value="${value//\"/\\\"}"
-  value="${value//\$/\\$}"
-  value="${value//\`/\\\`}"
-  printf '"%s"' "${value}"
+  if [[ "${value}" == \"*\" && "${value}" == *\" ]]; then
+    value="${value:1:${#value}-2}"
+    value="${value//\\\\/\\}"
+    value="${value//\\\"/\"}"
+    value="${value//\\\$/\$}"
+    value="${value//\\\`/\`}"
+  fi
+  printf '%s' "${value}"
 }
 
 is_local_db_host() {
@@ -1186,16 +1137,47 @@ set_postgres_port() {
 load_existing_env() {
   if [[ -f "${ENV_FILE}" ]]; then
     ENV_FILE_ALREADY_PRESENT="true"
-    # shellcheck disable=SC1090
-    source "${ENV_FILE}"
-    TG_BOT_TOKEN="${MAXOGRAM_TG_BOT_TOKEN:-${TG_BOT_TOKEN}}"
-    MAX_BOT_TOKEN="${MAXOGRAM_MAX_BOT_TOKEN:-${MAX_BOT_TOKEN}}"
-    DB_HOST="${MAXOGRAM_DB_HOST:-${DB_HOST}}"
-    DB_PORT="${MAXOGRAM_DB_PORT:-${DB_PORT}}"
-    DB_NAME="${MAXOGRAM_DB_DATABASE:-${DB_NAME}}"
-    DB_USER="${MAXOGRAM_DB_USER:-${DB_USER}}"
-    DB_PASSWORD="${MAXOGRAM_DB_PASSWORD:-${DB_PASSWORD}}"
-    DB_SCHEMA="${MAXOGRAM_DB_SCHEMA:-${DB_SCHEMA}}"
+    local line=""
+    local key=""
+    local value=""
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+      line="${line%$'\r'}"
+      [[ -n "${line}" ]] || continue
+      [[ "${line}" == \#* ]] && continue
+      [[ "${line}" == *=* ]] || continue
+
+      key="${line%%=*}"
+      value="${line#*=}"
+      value="$(normalize_env_file_value "${value}")"
+
+      case "${key}" in
+        MAXOGRAM_TG_BOT_TOKEN)
+          TG_BOT_TOKEN="${value}"
+          ;;
+        MAXOGRAM_MAX_BOT_TOKEN)
+          MAX_BOT_TOKEN="${value}"
+          ;;
+        MAXOGRAM_DB_HOST)
+          DB_HOST="${value}"
+          ;;
+        MAXOGRAM_DB_PORT)
+          DB_PORT="${value}"
+          ;;
+        MAXOGRAM_DB_DATABASE)
+          DB_NAME="${value}"
+          ;;
+        MAXOGRAM_DB_USER)
+          DB_USER="${value}"
+          ;;
+        MAXOGRAM_DB_PASSWORD)
+          DB_PASSWORD="${value}"
+          ;;
+        MAXOGRAM_DB_SCHEMA)
+          DB_SCHEMA="${value}"
+          ;;
+      esac
+    done < "${ENV_FILE}"
   fi
 }
 
@@ -1205,14 +1187,16 @@ prompt_value() {
   local default_value="${3:-}"
   local current_value
   current_value="${!__var_name:-}"
+  local prompt_suffix=""
 
   if [[ -n "${current_value}" ]]; then
     default_value="${current_value}"
+    prompt_suffix=" [press Enter to keep current value]"
   fi
 
   local input=""
   if [[ -n "${default_value}" ]]; then
-    read -r -p "${prompt_text} [${default_value}]: " input
+    read -r -p "${prompt_text}${prompt_suffix} [${default_value}]: " input
     input="${input:-${default_value}}"
   else
     read -r -p "${prompt_text}: " input
@@ -1349,300 +1333,74 @@ collect_update_inputs() {
   UPDATE_ROLE_PASSWORD="false"
 }
 
-ensure_app_user() {
-  if id "${APP_USER}" >/dev/null 2>&1; then
-    log "OS user ${APP_USER} already exists."
-    return 0
-  fi
-
-  log "Creating OS user ${APP_USER}..."
-  useradd \
-    --system \
-    --user-group \
-    --home-dir "${APP_HOME}" \
-    --create-home \
-    --shell "${NOLOGIN_SHELL}" \
-    "${APP_USER}"
-}
-
 validate_app_dir() {
   [[ "${APP_DIR}" == /* ]] || die "APP_DIR must be an absolute path."
   [[ "${APP_DIR}" != "/" ]] || die "APP_DIR must not be root."
 }
 
-ensure_repo_checkout() {
+docker_compose_available() {
+  have_cmd docker && docker compose version >/dev/null 2>&1
+}
+
+docker_daemon_available() {
+  have_cmd docker && docker info >/dev/null 2>&1
+}
+
+ensure_docker_installed() {
+  log "Ensuring Docker and Docker Compose are installed..."
+
+  if ! docker_compose_available; then
+    if [[ "${#DOCKER_PACKAGE_GROUPS[@]}" -gt 0 ]]; then
+      install_from_candidate_groups "Docker runtime" "${DOCKER_PACKAGE_GROUPS[@]}" || true
+    else
+      warn "No supported package-manager recipe for Docker on this distro. Expecting Docker to already be installed."
+    fi
+  fi
+
+  have_cmd docker || die "Docker CLI is missing. Install Docker manually and rerun the installer."
+  docker compose version >/dev/null 2>&1 || die "Docker Compose is unavailable. Install the Docker Compose plugin and rerun the installer."
+
+  if ! docker_daemon_available; then
+    if DOCKER_SERVICE_UNIT="$(service_enable_now_candidates "${DOCKER_SERVICE_CANDIDATES[@]}")"; then
+      log "Using Docker service ${DOCKER_SERVICE_UNIT}."
+    else
+      warn "Docker service name could not be detected automatically; continuing with direct daemon checks."
+    fi
+  fi
+
+  docker_daemon_available || die "Docker daemon is unavailable. Start Docker and rerun the installer."
+}
+
+ensure_deploy_dir() {
   validate_app_dir
-  ensure_required_cmd curl "curl is required to download the Maxogram source tarball."
-  ensure_required_cmd tar "tar is required to extract the Maxogram source tarball."
-  ensure_required_cmd find "find is required to inspect the extracted Maxogram source tree."
-
-  local work_root
-  local archive_path
-  local extract_root
-  local source_root
-  local venv_backup=""
-
-  work_root="$(mktemp -d "/tmp/${APP_NAME}-source-XXXXXX")"
-  archive_path="${work_root}/source.tar.gz"
-  extract_root="${work_root}/extract"
-
-  mkdir -p "${extract_root}"
-
-  log "Downloading ${APP_SOURCE_LABEL}..."
-  curl -fsSL "${APP_SOURCE_URL}" -o "${archive_path}"
-  tar -C "${extract_root}" -xzf "${archive_path}"
-
-  source_root="$(find "${extract_root}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
-  [[ -n "${source_root}" && -d "${source_root}" ]] || die "Could not find the extracted Maxogram source tree."
-  [[ -f "${source_root}/requirements.txt" ]] || die "The downloaded source tree is missing requirements.txt."
-
-  if [[ -d "${APP_DIR}/.venv" ]]; then
-    venv_backup="${work_root}/.venv"
-    mv "${APP_DIR}/.venv" "${venv_backup}"
-  fi
-
-  rm -rf "${APP_DIR}"
   install -d -m 755 "${APP_DIR}"
-
-  (
-    cd "${source_root}"
-    tar -cf - .
-  ) | (
-    cd "${APP_DIR}"
-    tar -xf -
-  )
-
-  if [[ -n "${venv_backup}" && -d "${venv_backup}" ]]; then
-    mv "${venv_backup}" "${APP_DIR}/.venv"
-  fi
-
-  chown -R "${APP_USER}:${APP_GROUP}" "${APP_DIR}"
-  rm -rf "${work_root}"
 }
 
-python_version_ge() {
-  local python_exec="$1"
-  local major="$2"
-  local minor="$3"
+write_compose_file() {
+  ensure_deploy_dir
 
-  "${python_exec}" - "$major" "$minor" <<'PY'
-import sys
-
-required_major = int(sys.argv[1])
-required_minor = int(sys.argv[2])
-sys.exit(0 if sys.version_info >= (required_major, required_minor) else 1)
-PY
+  cat > "${COMPOSE_FILE}" <<EOF
+services:
+  ${APP_NAME}:
+    image: ${DOCKER_IMAGE}
+    container_name: ${APP_NAME}
+    restart: unless-stopped
+    env_file:
+      - ${ENV_FILE}
+EOF
+  chmod 644 "${COMPOSE_FILE}"
 }
 
-python_version_series() {
-  local python_exec="$1"
-
-  "${python_exec}" - <<'PY'
-import sys
-
-print(f"{sys.version_info.major}.{sys.version_info.minor}")
-PY
+docker_compose_cmd() {
+  docker compose -f "${COMPOSE_FILE}" "$@"
 }
 
-discover_python_exec() {
-  local candidate
-  local resolved
-  local seen=" "
-
-  for candidate in "${PYTHON_COMMAND_CANDIDATES[@]}" "python3.13" "python3" "python"; do
-    if ! have_cmd "${candidate}"; then
-      continue
-    fi
-    resolved="$(command -v "${candidate}")"
-    if [[ "${seen}" == *" ${resolved} "* ]]; then
-      continue
-    fi
-    seen="${seen}${resolved} "
-    if python_version_ge "${resolved}" "${PYTHON_MIN_MAJOR}" "${PYTHON_MIN_MINOR}"; then
-      printf '%s\n' "${resolved}"
-      return 0
-    fi
-  done
-
-  return 1
-}
-
-python_can_create_working_venv() {
-  local python_exec="$1"
-  local probe_dir=""
-  local probe_python=""
-  local status=0
-
-  probe_dir="$(mktemp -d "/tmp/${APP_NAME}-venv-probe-XXXXXX")"
-  probe_python="${probe_dir}/bin/python"
-
-  if ! "${python_exec}" -m venv "${probe_dir}" >/dev/null 2>&1; then
-    status=1
-  elif ! "${probe_python}" -m pip --version >/dev/null 2>&1; then
-    status=1
-  fi
-
-  rm -rf "${probe_dir}"
-  return "${status}"
-}
-
-try_debian_python_venv_repair() {
-  local python_exec="$1"
-  local version_series=""
-  local package=""
-  local seen=" "
-  local -a repair_packages=()
-
-  if [[ "${PKG_MANAGER}" != "apt" || "${python_exec}" != /usr/bin/* ]]; then
-    return 1
-  fi
-
-  version_series="$(python_version_series "${python_exec}" 2>/dev/null || true)"
-  log "Trying Debian/Ubuntu venv package repair for ${python_exec}."
-
-  if [[ -n "${version_series}" ]]; then
-    repair_packages+=("python${version_series}-venv")
-  fi
-  repair_packages+=("python3-venv")
-
-  for package in "${repair_packages[@]}"; do
-    if [[ "${seen}" == *" ${package} "* ]]; then
-      continue
-    fi
-    seen="${seen}${package} "
-    log "Attempting to install ${package}..."
-    if try_install_packages "${package}"; then
-      if python_can_create_working_venv "${python_exec}"; then
-        return 0
-      fi
-      warn "Installed ${package}, but ${python_exec} still cannot create a working virtual environment."
-    fi
-  done
-
-  return 1
-}
-
-select_python_exec_if_ready() {
-  local python_exec="$1"
-  local source_label="$2"
-  local version_series=""
-
-  version_series="$(python_version_series "${python_exec}" 2>/dev/null || true)"
-  if [[ -z "${version_series}" ]]; then
-    version_series="unknown"
-  fi
-
-  log "Found Python ${version_series} at ${python_exec}."
-  if python_can_create_working_venv "${python_exec}"; then
-    PYTHON_EXEC="${python_exec}"
-    PYTHON_VENV_READY="true"
-    log "Using ${source_label} Python at ${python_exec}."
-    return 0
-  fi
-
-  warn "Python ${version_series} at ${python_exec} cannot create working virtual environments."
-  if try_debian_python_venv_repair "${python_exec}"; then
-    PYTHON_EXEC="${python_exec}"
-    PYTHON_VENV_READY="true"
-    log "Using repaired Python ${version_series} at ${python_exec}."
-    return 0
-  fi
-
-  return 1
-}
-
-install_python_build_dependencies() {
-  if [[ "${#BUILD_DEP_PACKAGE_GROUPS[@]}" -eq 0 ]]; then
-    warn "No known build-dependency set for this distro. Python source build will rely on existing build tools."
-    return 0
-  fi
-
-  install_from_candidate_groups "Python build dependencies" "${BUILD_DEP_PACKAGE_GROUPS[@]}" || true
-}
-
-build_python_from_source() {
-  install_python_build_dependencies
-
-  local build_root="/tmp/${APP_NAME}-python-build"
-  rm -rf "${build_root}"
-  mkdir -p "${build_root}"
-
-  ensure_required_cmd curl "curl is required to download the Python source tarball."
-  ensure_required_cmd tar "tar is required to extract the Python source tarball."
-
-  curl -fsSL \
-    "https://www.python.org/ftp/python/${PYTHON_FALLBACK_VERSION}/Python-${PYTHON_FALLBACK_VERSION}.tgz" \
-    -o "${build_root}/Python.tgz"
-  tar -C "${build_root}" -xf "${build_root}/Python.tgz"
-
-  local source_dir="${build_root}/Python-${PYTHON_FALLBACK_VERSION}"
-  local jobs="2"
-  if have_cmd getconf; then
-    jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')"
-  fi
-
-  (
-    cd "${source_dir}"
-    ./configure --enable-optimizations --with-ensurepip=install
-    make -j"${jobs}"
-    make altinstall
-  )
-}
-
-ensure_python() {
-  local discovered_python=""
-
-  export PATH="/usr/local/bin:${PATH}"
-  PYTHON_VENV_READY="false"
-
-  discovered_python="$(discover_python_exec || true)"
-  if [[ -n "${discovered_python}" ]] && select_python_exec_if_ready "${discovered_python}" "system"; then
-    return 0
-  fi
-
-  log "Trying to install a Python interpreter >= 3.13 from OS packages..."
-  if [[ "${#PYTHON_PACKAGE_GROUPS[@]}" -gt 0 ]]; then
-    install_from_candidate_groups "Python >= 3.13" "${PYTHON_PACKAGE_GROUPS[@]}" || true
-    discovered_python="$(discover_python_exec || true)"
-    if [[ -n "${discovered_python}" ]] && select_python_exec_if_ready "${discovered_python}" "packaged"; then
-      return 0
-    fi
-  else
-    warn "No package-manager recipe is available for Python on this distro."
-  fi
-
-  warn "Falling back to source-built Python ${PYTHON_FALLBACK_VERSION} because no discovered interpreter could create a working virtual environment."
-  build_python_from_source
-
-  discovered_python="$(discover_python_exec || true)"
-  [[ -n "${discovered_python}" ]] || die "Python build finished, but no interpreter >= 3.13 is available."
-  if ! select_python_exec_if_ready "${discovered_python}" "source-built"; then
-    die "Python build finished, but ${discovered_python} still cannot create a working virtual environment."
-  fi
-}
-
-ensure_virtualenv() {
-  local venv_python="${APP_DIR}/.venv/bin/python"
-
-  if [[ "${PYTHON_VENV_READY}" != "true" ]] && ! python_can_create_working_venv "${PYTHON_EXEC}"; then
-    die "Python interpreter ${PYTHON_EXEC} was found, but it cannot create a working virtual environment with pip support."
-  fi
-
-  if [[ -d "${APP_DIR}/.venv" ]]; then
-    log "Upgrading existing virtual environment..."
-    if ! run_as_app "${PYTHON_EXEC}" -m venv --upgrade "${APP_DIR}/.venv"; then
-      die "Python interpreter ${PYTHON_EXEC} was selected, but it could not create a seeded virtual environment in ${APP_DIR}/.venv."
-    fi
-  else
-    log "Creating virtual environment in ${APP_DIR}/.venv..."
-    if ! run_as_app "${PYTHON_EXEC}" -m venv "${APP_DIR}/.venv"; then
-      die "Python interpreter ${PYTHON_EXEC} was selected, but it could not create a seeded virtual environment in ${APP_DIR}/.venv."
-    fi
-  fi
-
-  run_as_app "${venv_python}" -m ensurepip --upgrade
-  run_as_app "${venv_python}" -m pip install --upgrade pip setuptools wheel
-  run_as_app "${venv_python}" -m pip install --upgrade -r "${APP_DIR}/requirements.txt"
+docker_run_maxogram_cli() {
+  docker run --rm \
+    --env-file "${ENV_FILE}" \
+    --entrypoint python \
+    "${DOCKER_IMAGE}" \
+    -m maxogram --root /app "$@"
 }
 
 ensure_database_role_and_db() {
@@ -1709,157 +1467,66 @@ write_env_file() {
   install -d -m 700 "${ENV_DIR}"
   umask 077
   cat > "${ENV_FILE}" <<EOF
-MAXOGRAM_TG_BOT_TOKEN=$(quote_env_value "${TG_BOT_TOKEN}")
-MAXOGRAM_MAX_BOT_TOKEN=$(quote_env_value "${MAX_BOT_TOKEN}")
-MAXOGRAM_DB_DATABASE=$(quote_env_value "${DB_NAME}")
-MAXOGRAM_DB_USER=$(quote_env_value "${DB_USER}")
-MAXOGRAM_DB_PASSWORD=$(quote_env_value "${DB_PASSWORD}")
-MAXOGRAM_DB_HOST=$(quote_env_value "${DB_HOST}")
-MAXOGRAM_DB_PORT=$(quote_env_value "${DB_PORT}")
-MAXOGRAM_DB_SCHEMA=$(quote_env_value "${DB_SCHEMA}")
+MAXOGRAM_TG_BOT_TOKEN=${TG_BOT_TOKEN}
+MAXOGRAM_MAX_BOT_TOKEN=${MAX_BOT_TOKEN}
+MAXOGRAM_DB_DATABASE=${DB_NAME}
+MAXOGRAM_DB_USER=${DB_USER}
+MAXOGRAM_DB_PASSWORD=${DB_PASSWORD}
+MAXOGRAM_DB_HOST=${DB_HOST}
+MAXOGRAM_DB_PORT=${DB_PORT}
+MAXOGRAM_DB_SCHEMA=${DB_SCHEMA}
 EOF
   chmod 600 "${ENV_FILE}"
 }
 
-run_maxogram_cli() {
-  run_as_app env \
-    MAXOGRAM_TG_BOT_TOKEN="${TG_BOT_TOKEN}" \
-    MAXOGRAM_MAX_BOT_TOKEN="${MAX_BOT_TOKEN}" \
-    MAXOGRAM_DB_DATABASE="${DB_NAME}" \
-    MAXOGRAM_DB_USER="${DB_USER}" \
-    MAXOGRAM_DB_PASSWORD="${DB_PASSWORD}" \
-    MAXOGRAM_DB_HOST="${DB_HOST}" \
-    MAXOGRAM_DB_PORT="${DB_PORT}" \
-    MAXOGRAM_DB_SCHEMA="${DB_SCHEMA}" \
-    "${APP_DIR}/.venv/bin/python" -m maxogram --root "${APP_DIR}" "$@"
+pull_docker_image() {
+  log "Pulling Docker image ${DOCKER_IMAGE}..."
+  docker_compose_cmd pull "${APP_NAME}"
 }
 
-verify_database_connection() {
-  log "Checking database connectivity..."
-  run_as_app env \
-    MAXOGRAM_DB_DATABASE="${DB_NAME}" \
-    MAXOGRAM_DB_USER="${DB_USER}" \
-    MAXOGRAM_DB_PASSWORD="${DB_PASSWORD}" \
-    MAXOGRAM_DB_HOST="${DB_HOST}" \
-    MAXOGRAM_DB_PORT="${DB_PORT}" \
-    "${APP_DIR}/.venv/bin/python" - <<'PY'
-import asyncio
-import os
-
-import asyncpg
-
-
-async def main() -> None:
-    conn = await asyncpg.connect(
-        database=os.environ["MAXOGRAM_DB_DATABASE"],
-        user=os.environ["MAXOGRAM_DB_USER"],
-        password=os.environ["MAXOGRAM_DB_PASSWORD"],
-        host=os.environ["MAXOGRAM_DB_HOST"],
-        port=int(os.environ["MAXOGRAM_DB_PORT"]),
-    )
-    await conn.close()
-
-
-asyncio.run(main())
-PY
+validate_container_config() {
+  log "Validating runtime configuration inside the container..."
+  docker_run_maxogram_cli check-config >/dev/null
 }
 
-write_systemd_unit() {
-  local after_line="After=network-online.target"
-  if [[ "${LOCAL_DB_TARGET}" == "true" && -n "${POSTGRES_SERVICE_UNIT}" ]]; then
-    after_line="After=network-online.target ${POSTGRES_SERVICE_UNIT}"
+apply_container_migrations() {
+  log "Applying database migrations inside the container..."
+  docker_run_maxogram_cli db-upgrade
+}
+
+deploy_container() {
+  log "Recreating the Docker service..."
+  docker_compose_cmd up -d
+}
+
+remove_legacy_host_artifacts() {
+  local daemon_reload_needed="false"
+
+  if [[ -f "${LEGACY_SYSTEMD_UNIT}" ]]; then
+    "${SYSTEMCTL_BIN}" disable --now "${APP_NAME}.service" >/dev/null 2>&1 || true
+    rm -f "${LEGACY_SYSTEMD_UNIT}"
+    daemon_reload_needed="true"
   fi
 
-  cat > "${SYSTEMD_UNIT}" <<EOF
-[Unit]
-Description=Maxogram bridge bot
-Wants=network-online.target
-${after_line}
-
-[Service]
-Type=simple
-User=${APP_USER}
-Group=${APP_GROUP}
-WorkingDirectory=${APP_DIR}
-EnvironmentFile=${ENV_FILE}
-ExecStart=${APP_DIR}/.venv/bin/python -m maxogram --root ${APP_DIR} run
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  "${SYSTEMCTL_BIN}" daemon-reload
-  "${SYSTEMCTL_BIN}" enable --now "${APP_NAME}.service"
-}
-
-write_cron_restart() {
-  if [[ "${#CRON_PACKAGE_GROUPS[@]}" -gt 0 ]]; then
-    install_from_candidate_groups "cron watchdog packages" "${CRON_PACKAGE_GROUPS[@]}" || true
+  if [[ -f "${LEGACY_CRON_FILE}" ]]; then
+    rm -f "${LEGACY_CRON_FILE}"
   fi
 
-  if CRON_SERVICE_UNIT="$(service_enable_now_candidates "${CRON_SERVICE_CANDIDATES[@]}")"; then
-    "${SYSTEMCTL_BIN}" disable --now "maxogram-restart.timer" >/dev/null 2>&1 || true
-    rm -f "${RESTART_TIMER_SERVICE}" "${RESTART_TIMER_UNIT}"
-    cat > "${CRON_FILE}" <<EOF
-# Managed by ${APP_NAME} install.sh
-0 */4 * * * root ${SYSTEMCTL_BIN} restart ${APP_NAME}.service >/dev/null 2>&1
-EOF
-    chmod 644 "${CRON_FILE}"
-    WATCHDOG_MODE="cron"
-    log "Using cron watchdog via ${CRON_SERVICE_UNIT}."
-    return 0
+  if [[ -f "${LEGACY_RESTART_TIMER_SERVICE}" || -f "${LEGACY_RESTART_TIMER_UNIT}" ]]; then
+    "${SYSTEMCTL_BIN}" disable --now "${APP_NAME}-restart.timer" >/dev/null 2>&1 || true
+    rm -f "${LEGACY_RESTART_TIMER_SERVICE}" "${LEGACY_RESTART_TIMER_UNIT}"
+    daemon_reload_needed="true"
   fi
 
-  return 1
-}
-
-write_restart_timer() {
-  rm -f "${CRON_FILE}"
-
-  cat > "${RESTART_TIMER_SERVICE}" <<EOF
-[Unit]
-Description=Restart Maxogram service
-
-[Service]
-Type=oneshot
-ExecStart=${SYSTEMCTL_BIN} restart ${APP_NAME}.service
-EOF
-
-  cat > "${RESTART_TIMER_UNIT}" <<EOF
-[Unit]
-Description=Restart Maxogram every 4 hours
-
-[Timer]
-OnBootSec=4h
-OnUnitActiveSec=4h
-Persistent=true
-Unit=maxogram-restart.service
-
-[Install]
-WantedBy=timers.target
-EOF
-
-  "${SYSTEMCTL_BIN}" daemon-reload
-  "${SYSTEMCTL_BIN}" enable --now "maxogram-restart.timer"
-  WATCHDOG_MODE="timer"
-  log "Using systemd timer watchdog."
-}
-
-write_restart_watchdog() {
-  if write_cron_restart; then
-    return 0
+  if [[ "${daemon_reload_needed}" == "true" ]]; then
+    "${SYSTEMCTL_BIN}" daemon-reload
+    log "Removed legacy host-level Maxogram systemd artifacts."
   fi
-
-  warn "Cron watchdog is unavailable; falling back to a systemd timer."
-  write_restart_timer
 }
 
 main() {
   require_root
   ensure_systemd_available
-  detect_nologin_shell
 
   if [[ "${MODE}" != "auto" && "${MODE}" != "manual" && "${MODE}" != "update" ]]; then
     usage
@@ -1871,8 +1538,6 @@ main() {
   ensure_base_packages
   ensure_required_cmd sed "sed is required by the installer."
   ensure_required_cmd grep "grep is required by the installer."
-  ensure_required_cmd curl "curl is required by the installer."
-  ensure_required_cmd tar "tar is required by the installer."
 
   case "${MODE}" in
     auto)
@@ -1900,47 +1565,38 @@ main() {
     fi
   fi
 
-  ensure_app_user
-  ensure_repo_checkout
-  ensure_python
-  ensure_virtualenv
-
   if [[ "${LOCAL_DB_TARGET}" == "true" && "${MODE}" != "update" ]]; then
     ensure_database_role_and_db
     create_schema_and_search_path
   fi
 
   write_env_file
-  verify_database_connection
-
-  log "Validating runtime configuration..."
-  run_maxogram_cli check-config >/dev/null
-
-  log "Applying database migrations..."
-  run_maxogram_cli db-upgrade
-
-  write_systemd_unit
-  write_restart_watchdog
-
-  "${SYSTEMCTL_BIN}" restart "${APP_NAME}.service"
+  write_compose_file
+  ensure_docker_installed
+  pull_docker_image
+  validate_container_config
+  apply_container_migrations
+  remove_legacy_host_artifacts
+  deploy_container
 
   cat <<EOF
 
 Installation complete.
 
 Mode:            ${MODE}
-Source:          ${APP_SOURCE_LABEL}
-App directory:   ${APP_DIR}
+Image:           ${DOCKER_IMAGE}
+Deploy directory: ${APP_DIR}
+Compose file:    ${COMPOSE_FILE}
 Config file:     ${ENV_FILE}
-Service:         ${APP_NAME}.service
 Database:        ${DB_NAME} on ${DB_HOST}:${DB_PORT}
 Schema:          ${DB_SCHEMA}
-Watchdog:        ${WATCHDOG_MODE}
+Restart policy:  unless-stopped
 
 Useful commands:
-  systemctl status ${APP_NAME}
-  journalctl -u ${APP_NAME} -f
-  systemctl restart ${APP_NAME}
+  docker compose -f ${COMPOSE_FILE} ps
+  docker compose -f ${COMPOSE_FILE} logs -f
+  docker compose -f ${COMPOSE_FILE} pull
+  docker compose -f ${COMPOSE_FILE} up -d
 EOF
 }
 

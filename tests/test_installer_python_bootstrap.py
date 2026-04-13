@@ -32,7 +32,9 @@ def bash_path() -> str:
     return resolved
 
 
-def run_bash(script: str, *, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def run_bash(
+    script: str, *, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
@@ -57,179 +59,179 @@ def source_install_and_run(script_body: str) -> subprocess.CompletedProcess[str]
     return run_bash(script)
 
 
-def test_debian_repairs_existing_python_with_versioned_venv_package(tmp_path: Path) -> None:
+def test_installs_docker_runtime_and_starts_service_when_needed(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
 
     result = source_install_and_run(
         f"""
         mkdir -p "{state_dir.as_posix()}"
         PKG_MANAGER="apt"
-        PYTHON_PACKAGE_GROUPS=("python3.13 python3.13-venv python3.13-dev")
-        discover_python_exec() {{ printf '/usr/bin/python3.13\\n'; }}
-        python_version_series() {{ printf '3.13\\n'; }}
-        python_can_create_working_venv() {{ [[ -f "{(state_dir / 'ready').as_posix()}" ]]; }}
-        try_install_packages() {{
-          printf 'install=%s\\n' "$*"
-          if [[ "$1" == "python3.13-venv" ]]; then
-            touch "{(state_dir / 'ready').as_posix()}"
-            return 0
+        DOCKER_PACKAGE_GROUPS=("docker.io docker-compose-v2" "docker.io docker-compose-plugin")
+        docker() {{
+          if [[ "$1" == "compose" && "$2" == "version" ]]; then
+            [[ -f "{(state_dir / 'compose-ready').as_posix()}" ]]
+            return $?
           fi
-          return 1
-        }}
-        build_python_from_source() {{
-          echo "build-source"
-          touch "{(state_dir / 'built').as_posix()}"
-        }}
-        ensure_python
-        printf 'python=%s\\nvenv_ready=%s\\n' "$PYTHON_EXEC" "$PYTHON_VENV_READY"
-        if [[ -f "{(state_dir / 'built').as_posix()}" ]]; then
-          printf 'built=yes\\n'
-        else
-          printf 'built=no\\n'
-        fi
-        """
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert "install=python3.13-venv" in result.stdout
-    assert "install=python3-venv" not in result.stdout
-    assert "python=/usr/bin/python3.13" in result.stdout
-    assert "venv_ready=true" in result.stdout
-    assert "built=no" in result.stdout
-
-
-def test_debian_falls_back_to_generic_python3_venv_package(tmp_path: Path) -> None:
-    state_dir = tmp_path / "state"
-
-    result = source_install_and_run(
-        f"""
-        mkdir -p "{state_dir.as_posix()}"
-        PKG_MANAGER="apt"
-        PYTHON_PACKAGE_GROUPS=("python3.13 python3.13-venv python3.13-dev")
-        discover_python_exec() {{ printf '/usr/bin/python3.13\\n'; }}
-        python_version_series() {{ printf '3.13\\n'; }}
-        python_can_create_working_venv() {{ [[ -f "{(state_dir / 'ready').as_posix()}" ]]; }}
-        try_install_packages() {{
-          printf 'install=%s\\n' "$*"
-          if [[ "$1" == "python3-venv" ]]; then
-            touch "{(state_dir / 'ready').as_posix()}"
-            return 0
+          if [[ "$1" == "info" ]]; then
+            [[ -f "{(state_dir / 'daemon-ready').as_posix()}" ]]
+            return $?
           fi
-          return 1
-        }}
-        build_python_from_source() {{
-          echo "build-source"
-          touch "{(state_dir / 'built').as_posix()}"
-        }}
-        ensure_python
-        printf 'python=%s\\nvenv_ready=%s\\n' "$PYTHON_EXEC" "$PYTHON_VENV_READY"
-        if [[ -f "{(state_dir / 'built').as_posix()}" ]]; then
-          printf 'built=yes\\n'
-        else
-          printf 'built=no\\n'
-        fi
-        """
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert "install=python3.13-venv" in result.stdout
-    assert "install=python3-venv" in result.stdout
-    assert "python=/usr/bin/python3.13" in result.stdout
-    assert "venv_ready=true" in result.stdout
-    assert "built=no" in result.stdout
-
-
-def test_existing_venv_capable_python_skips_repairs_and_fallback() -> None:
-    result = source_install_and_run(
-        """
-        PKG_MANAGER="apt"
-        PYTHON_PACKAGE_GROUPS=("python3.13 python3.13-venv python3.13-dev")
-        discover_python_exec() { printf '/usr/bin/python3.13\n'; }
-        python_version_series() { printf '3.13\n'; }
-        python_can_create_working_venv() { return 0; }
-        try_install_packages() { echo "unexpected-install"; exit 97; }
-        build_python_from_source() { echo "unexpected-build"; exit 98; }
-        ensure_python
-        printf 'python=%s\nvenv_ready=%s\n' "$PYTHON_EXEC" "$PYTHON_VENV_READY"
-        """
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert "unexpected-install" not in result.stdout
-    assert "unexpected-build" not in result.stdout
-    assert "python=/usr/bin/python3.13" in result.stdout
-    assert "venv_ready=true" in result.stdout
-
-
-def test_non_apt_uses_source_build_fallback_when_system_python_cannot_make_venv(tmp_path: Path) -> None:
-    state_dir = tmp_path / "state"
-
-    result = source_install_and_run(
-        f"""
-        mkdir -p "{state_dir.as_posix()}"
-        PKG_MANAGER="dnf"
-        PYTHON_PACKAGE_GROUPS=("python3.13 python3.13-devel")
-        discover_python_exec() {{
-          if [[ -f "{(state_dir / 'built').as_posix()}" ]]; then
-            printf '/usr/local/bin/python3.13\\n'
-          else
-            printf '/usr/bin/python3.13\\n'
-          fi
-        }}
-        python_version_series() {{ printf '3.13\\n'; }}
-        python_can_create_working_venv() {{
-          [[ "$1" == "/usr/local/bin/python3.13" ]]
-        }}
-        install_from_candidate_groups() {{
-          printf 'packages=%s\\n' "$1"
           return 0
         }}
-        build_python_from_source() {{
-          echo "build-source"
-          touch "{(state_dir / 'built').as_posix()}"
+        install_from_candidate_groups() {{
+          printf 'install=%s\\n' "$1"
+          touch "{(state_dir / 'compose-ready').as_posix()}"
+          return 0
         }}
-        ensure_python
-        printf 'python=%s\\nvenv_ready=%s\\n' "$PYTHON_EXEC" "$PYTHON_VENV_READY"
-        if [[ -f "{(state_dir / 'built').as_posix()}" ]]; then
-          printf 'built=yes\\n'
-        else
-          printf 'built=no\\n'
-        fi
+        service_enable_now_candidates() {{
+          touch "{(state_dir / 'daemon-ready').as_posix()}"
+          printf 'docker.service\\n'
+          return 0
+        }}
+        ensure_docker_installed
+        printf 'service=%s\\n' "$DOCKER_SERVICE_UNIT"
         """
     )
 
     assert result.returncode == 0, result.stderr
-    assert "packages=Python >= 3.13" in result.stdout
-    assert "build-source" in result.stdout
-    assert "python=/usr/local/bin/python3.13" in result.stdout
-    assert "venv_ready=true" in result.stdout
-    assert "built=yes" in result.stdout
+    assert "install=Docker runtime" in result.stdout
+    assert "service=docker.service" in result.stdout
 
 
-def test_python_bootstrap_fails_early_when_no_working_venv_is_possible(tmp_path: Path) -> None:
-    state_dir = tmp_path / "state"
-
+def test_fails_when_docker_compose_stays_unavailable() -> None:
     result = source_install_and_run(
-        f"""
-        mkdir -p "{state_dir.as_posix()}"
-        PKG_MANAGER="generic"
-        PYTHON_PACKAGE_GROUPS=()
-        discover_python_exec() {{
-          if [[ -f "{(state_dir / 'built').as_posix()}" ]]; then
-            printf '/usr/local/bin/python3.13\\n'
-          else
-            printf '/usr/bin/python3.13\\n'
+        """
+        PKG_MANAGER="apt"
+        DOCKER_PACKAGE_GROUPS=("docker.io docker-compose-v2")
+        docker() {
+          if [[ "$1" == "compose" && "$2" == "version" ]]; then
+            return 1
           fi
-        }}
-        python_version_series() {{ printf '3.13\\n'; }}
-        python_can_create_working_venv() {{ return 1; }}
-        build_python_from_source() {{
-          echo "build-source"
-          touch "{(state_dir / 'built').as_posix()}"
-        }}
-        ensure_python
+          if [[ "$1" == "info" ]]; then
+            return 0
+          fi
+          return 0
+        }
+        install_from_candidate_groups() {
+          printf 'install=%s\n' "$1"
+          return 0
+        }
+        ensure_docker_installed
         """
     )
 
     assert result.returncode != 0
-    assert "cannot create a working virtual environment" in result.stderr
+    assert "Docker Compose is unavailable" in result.stderr
+
+
+def test_load_existing_env_supports_old_quoted_values(tmp_path: Path) -> None:
+    env_file = tmp_path / "maxogram.env"
+    env_file.write_text(
+        textwrap.dedent(
+            """
+            MAXOGRAM_TG_BOT_TOKEN="tg-token"
+            MAXOGRAM_MAX_BOT_TOKEN=max-token
+            MAXOGRAM_DB_HOST=10.0.0.15
+            MAXOGRAM_DB_PORT=55432
+            MAXOGRAM_DB_DATABASE=maxogram
+            MAXOGRAM_DB_USER=maxogram_app
+            MAXOGRAM_DB_PASSWORD="secret-value"
+            MAXOGRAM_DB_SCHEMA=maxogram
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = source_install_and_run(
+        f"""
+        ENV_FILE="{env_file.as_posix()}"
+        load_existing_env
+        printf 'tg=%s\\nmax=%s\\nhost=%s\\nport=%s\\npassword=%s\\n' \
+          "$TG_BOT_TOKEN" "$MAX_BOT_TOKEN" "$DB_HOST" "$DB_PORT" "$DB_PASSWORD"
+        """
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "tg=tg-token" in result.stdout
+    assert "max=max-token" in result.stdout
+    assert "host=10.0.0.15" in result.stdout
+    assert "port=55432" in result.stdout
+    assert "password=secret-value" in result.stdout
+
+
+def test_prompt_value_keeps_existing_value_on_enter() -> None:
+    result = source_install_and_run(
+        """
+        DB_HOST="db.example.com"
+        prompt_value DB_HOST "Database host" "127.0.0.1" <<< $'\n'
+        printf 'host=%s\n' "$DB_HOST"
+        """
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "host=db.example.com" in result.stdout
+
+
+def test_prompt_secret_keeps_existing_value_on_enter() -> None:
+    result = source_install_and_run(
+        """
+        TG_BOT_TOKEN="telegram-token"
+        prompt_secret TG_BOT_TOKEN "Telegram bot token" <<< $'\n'
+        printf 'token=%s\n' "$TG_BOT_TOKEN"
+        """
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "token=telegram-token" in result.stdout
+
+
+def test_auto_mode_stays_simpler_than_manual_mode() -> None:
+    result = source_install_and_run(
+        """
+        prompt_value_calls=0
+        prompt_secret_calls=0
+        prompt_value() {
+          prompt_value_calls=$((prompt_value_calls + 1))
+          local __var_name="$1"
+          local default_value="${3:-}"
+          local current_value="${!__var_name:-}"
+          if [[ -n "${current_value}" ]]; then
+            default_value="${current_value}"
+          fi
+          printf -v "${__var_name}" '%s' "${default_value}"
+        }
+        prompt_secret() {
+          prompt_secret_calls=$((prompt_secret_calls + 1))
+          local __var_name="$1"
+          local current_value="${!__var_name:-}"
+          if [[ -n "${current_value}" ]]; then
+            printf -v "${__var_name}" '%s' "${current_value}"
+          else
+            printf -v "${__var_name}" '%s' "filled"
+          fi
+        }
+
+        DB_HOST="db.example.com"
+        TG_BOT_TOKEN="tg"
+        MAX_BOT_TOKEN="mx"
+        DB_PASSWORD="pw"
+        collect_auto_inputs
+        printf 'auto_values=%s\\nauto_secrets=%s\\n' "$prompt_value_calls" "$prompt_secret_calls"
+
+        prompt_value_calls=0
+        prompt_secret_calls=0
+        DB_HOST="db.example.com"
+        TG_BOT_TOKEN="tg"
+        MAX_BOT_TOKEN="mx"
+        DB_PASSWORD="pw"
+        collect_manual_inputs
+        printf 'manual_values=%s\\nmanual_secrets=%s\\n' "$prompt_value_calls" "$prompt_secret_calls"
+        """
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "auto_values=0" in result.stdout
+    assert "auto_secrets=2" in result.stdout
+    assert "manual_values=5" in result.stdout
+    assert "manual_secrets=3" in result.stdout

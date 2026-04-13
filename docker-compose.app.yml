@@ -1,0 +1,12 @@
+services:
+  maxogram:
+    image: docker.io/d0ke/maxogram:latest
+    container_name: maxogram
+    restart: unless-stopped
+    env_file:
+      - /etc/maxogram/maxogram.env
+    # The installer writes /etc/maxogram/maxogram.env.
+    # Change this path only for a manual deployment flow.
+    # No ports are required unless a future HTTP endpoint is added.
+    # ports:
+    #   - "8000:8000"

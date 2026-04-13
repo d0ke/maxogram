@@ -6,7 +6,7 @@ Maxogram is a single-process Python asyncio bridge that mirrors one Telegram cha
 
 The repository currently implements:
 
-- a small deployment model centered around one long-running `systemd` service
+- a small deployment model centered around one long-running Docker container
 - PostgreSQL as the only durable store for bridge state, queues, mappings, and recovery data
 - configuration loaded from environment variables in production and `tokens.py` as a local-development fallback
 - Alembic-driven schema bootstrap and upgrades
@@ -29,7 +29,7 @@ Implemented CLI commands:
 
 Runtime settings are env-first:
 
-- production installs typically provide `MAXOGRAM_*` variables through `EnvironmentFile=/etc/maxogram/maxogram.env`
+- production installs typically provide `MAXOGRAM_*` variables through Docker Compose `env_file: /etc/maxogram/maxogram.env`
 - local CLI runs can also point to a dotenv-style file through `MAXOGRAM_ENV_FILE` or a repository-local `.env`
 - when no `MAXOGRAM_*` runtime config is present, the app falls back to local `tokens.py`
 
@@ -54,6 +54,14 @@ Optional env settings:
 - `MAXOGRAM_VPS_SSH_PORT`
 
 The `AppSettings` and `DatabaseConfig` shapes remain the same regardless of whether config came from env or `tokens.py`.
+
+Installer-managed production deployment now works like this:
+
+- `install.sh` can still install or reuse a local PostgreSQL instance and schema
+- `install.sh` writes `/etc/maxogram/maxogram.env`
+- `install.sh` writes `/opt/maxogram/docker-compose.app.yml`
+- the public runtime artifact is `docker.io/d0ke/maxogram:latest`
+- the long-running bridge process is supervised through Docker `restart: unless-stopped`
 
 ### Package Layout
 

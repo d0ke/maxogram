@@ -1,8 +1,12 @@
 # Maxogram
 
-Maxogram is a self-hosted Telegram-to-MAX bridge bot built around a single Python service and PostgreSQL.
+Maxogram is a self-hosted Telegram-to-MAX bridge bot built around one Python service and PostgreSQL.
 
-It mirrors linked chats in both directions and keeps the bridge state durable enough for retries, edits, deletes, reply mapping, and restart recovery.
+Production deployment is Docker-first:
+
+- the application runs from the public image `docker.io/d0ke/maxogram:latest`
+- PostgreSQL stays on the VPS host or on a remote server
+- `install.sh` manages PostgreSQL discovery/provisioning plus Docker Compose deployment
 
 ## What It Supports
 
@@ -15,6 +19,12 @@ It mirrors linked chats in both directions and keeps the bridge state durable en
 - Real media relay for common attachment types such as photos, videos, GIF-style animations, documents, audio, voice messages, and stickers.
 - Recovery flows backed by PostgreSQL queues, message mappings, and pending-mutation replay.
 
+## Official Production Artifact
+
+- Docker image: `docker.io/d0ke/maxogram:latest`
+- Installer-managed env file: `/etc/maxogram/maxogram.env`
+- Installer-managed compose file: `/opt/maxogram/docker-compose.app.yml`
+
 ## One-Line Install
 
 ### Auto Mode
@@ -23,24 +33,19 @@ It mirrors linked chats in both directions and keeps the bridge state durable en
 curl -fsSL https://raw.githubusercontent.com/d0ke/maxogram/main/install.sh | sudo bash -s -- auto
 ```
 
-Auto mode asks:
+Auto mode:
 
-- Telegram bot token
-- MAX bot token
-
-It may also ask for the existing `maxogram_app` database password if:
-
-- PostgreSQL is local
-- `/etc/maxogram/maxogram.env` does not exist yet
-- the local PostgreSQL role `maxogram_app` already exists
+- defaults to local PostgreSQL on `127.0.0.1`
+- asks Telegram and MAX bot tokens
+- may ask for the existing `maxogram_app` password if the local PostgreSQL role already exists and no env file exists yet
+- keeps current env values when `/etc/maxogram/maxogram.env` already exists and you press Enter
 
 Auto defaults:
 
-- OS user: `maxogram`
-- app directory: `/opt/maxogram`
+- deployment directory: `/opt/maxogram`
 - env file: `/etc/maxogram/maxogram.env`
 - database host: `127.0.0.1`
-- database port: detected selected local PostgreSQL instance port; `5432` is only the pre-detection fallback for fresh single-instance installs
+- database port: detected selected local PostgreSQL instance port; `5432` is only the pre-detection fallback for a fresh single-instance install
 - database name: `maxogram`
 - database user: `maxogram_app`
 - schema name: `maxogram`
@@ -76,34 +81,30 @@ Update mode:
 
 - requires an existing `/etc/maxogram/maxogram.env`
 - asks no questions
-- refreshes the application source from GitHub
-- upgrades `.venv` and dependencies
-- runs `check-config` and `db-upgrade`
-- restarts `maxogram.service`
+- pulls the latest `docker.io/d0ke/maxogram:latest`
+- runs in-container `check-config`
+- runs in-container `db-upgrade`
+- recreates the Docker Compose service
+- removes legacy host `systemd` and watchdog artifacts from the old native installer if they still exist
 
 ## What The Installer Does
 
 - verifies that it is running as `root`
 - detects Debian/Ubuntu, Fedora/RHEL-family, openSUSE, and Arch Linux explicitly
 - falls back to a generic Linux best-effort path when the distro is unknown
-- downloads the public GitHub tarball for `main` instead of using `git`
+- installs Docker and the Docker Compose plugin when they are missing
+- enables and starts the Docker daemon when needed
 - installs PostgreSQL if it is missing and a local database host is being used
 - uses the detected package manager when one is available: `apt`, `dnf`, `zypper`, or `pacman`
 - resolves one concrete local PostgreSQL target before any admin action and can reconfigure its port in `manual` mode
 - selects a local PostgreSQL target in this order: existing local Maxogram env port match, cluster or instance already containing the Maxogram role or database, highest live major version, otherwise an explicit ambiguity error
 - creates or reuses the local PostgreSQL role, database, and schema when PostgreSQL is local
-- reuses existing Maxogram data and applies only `python -m maxogram db-upgrade`
-- creates or reuses the dedicated `maxogram` system user
-- uses a Python `>= 3.13` only when it can successfully create a working virtual environment with `pip`
-- on Debian/Ubuntu, may install the matching `pythonX.Y-venv` package or `python3-venv` automatically when the interpreter exists but `venv` support is missing
-- otherwise tries distro packages first and falls back to building Python `3.13` from source
-- creates or upgrades `.venv`
-- installs or upgrades Python dependencies
 - writes `/etc/maxogram/maxogram.env`
-- validates config with `python -m maxogram check-config`
-- installs and enables `maxogram.service`
-- installs a cron watchdog that restarts the service every four hours
-- falls back to a `systemd timer` when cron cannot be installed or started reliably
+- writes `/opt/maxogram/docker-compose.app.yml`
+- pulls the published image through `docker compose`
+- validates config with `python -m maxogram check-config` inside the image
+- applies database migrations with `python -m maxogram db-upgrade` inside the image
+- starts the long-running bridge container with `restart: unless-stopped`
 
 The installer does not:
 
@@ -112,22 +113,100 @@ The installer does not:
 - modify `pg_hba.conf`
 - drop existing Maxogram PostgreSQL data
 - require `git` on the server
+- require Python on the server
+
+## Manual Docker Deployment
+
+Use this path if you want to deploy without the installer.
+
+This path does not provision PostgreSQL for you. Create the database, role, password, and optional schema first.
+
+1. Install Docker and the Docker Compose plugin on the VPS.
+2. Create the config directory and env file:
+
+```bash
+sudo install -d -m 700 /etc/maxogram
+sudo cp .env.example /etc/maxogram/maxogram.env
+sudo chmod 600 /etc/maxogram/maxogram.env
+```
+
+3. Edit `/etc/maxogram/maxogram.env` and set:
+
+- `MAXOGRAM_TG_BOT_TOKEN`
+- `MAXOGRAM_MAX_BOT_TOKEN`
+- `MAXOGRAM_DB_DATABASE`
+- `MAXOGRAM_DB_USER`
+- `MAXOGRAM_DB_PASSWORD`
+- `MAXOGRAM_DB_HOST`
+- `MAXOGRAM_DB_PORT`
+- `MAXOGRAM_DB_SCHEMA` if you use installer-managed local schema provisioning
+
+4. Copy `docker-compose.app.yml` to `/opt/maxogram/docker-compose.app.yml`.
+5. Pull and start the service:
+
+```bash
+sudo install -d -m 755 /opt/maxogram
+sudo cp docker-compose.app.yml /opt/maxogram/docker-compose.app.yml
+sudo docker compose -f /opt/maxogram/docker-compose.app.yml pull
+sudo docker compose -f /opt/maxogram/docker-compose.app.yml up -d
+```
+
+6. Check logs:
+
+```bash
+sudo docker compose -f /opt/maxogram/docker-compose.app.yml logs -f
+```
+
+## Docker Hub and GitHub Actions Setup
+
+The repository already contains `.github/workflows/docker-publish.yml` and publishes `docker.io/d0ke/maxogram`.
+
+### Docker Hub
+
+1. Open Docker Hub.
+2. Go to `Account settings -> Personal access tokens`.
+3. Click `Generate new token`.
+4. Create a token with read/write access and copy it immediately.
+
+### GitHub
+
+1. Open the repository on GitHub.
+2. Go to `Settings -> Secrets and variables -> Actions`.
+3. Click `New repository secret`.
+4. Create:
+   - `DOCKERHUB_USERNAME`
+   - `DOCKERHUB_TOKEN`
+
+### Publish Flow
+
+1. Push to `main`, or push a tag like `v0.1.0`.
+2. Open `Actions` in GitHub.
+3. Run or inspect the `Build and push Docker image` workflow.
+4. Confirm that Docker Hub shows the updated `d0ke/maxogram` tags.
+
+The workflow publishes:
+
+- `latest` on the default branch
+- branch tags
+- git tag tags
+- commit `sha` tags
+
+## Operations
+
+```bash
+sudo docker compose -f /opt/maxogram/docker-compose.app.yml ps
+sudo docker compose -f /opt/maxogram/docker-compose.app.yml logs -f
+sudo docker compose -f /opt/maxogram/docker-compose.app.yml pull
+sudo docker compose -f /opt/maxogram/docker-compose.app.yml up -d
+sudo docker compose -f /opt/maxogram/docker-compose.app.yml down
+```
 
 ## Runtime Model
 
-- production config comes from environment variables, usually via `EnvironmentFile=/etc/maxogram/maxogram.env`
+- production config comes from environment variables, usually via `/etc/maxogram/maxogram.env`
 - local development can still use `tokens.py`
-- the service starts at boot through `systemd`
+- the application container runs with Docker Compose and `restart: unless-stopped`
 - PostgreSQL is the only durable store
-
-## Service Management
-
-```bash
-sudo systemctl status maxogram
-sudo journalctl -u maxogram -f
-sudo systemctl restart maxogram
-sudo systemctl stop maxogram
-```
 
 ## Supported Operating Systems
 
@@ -141,4 +220,4 @@ sudo systemctl stop maxogram
 
 - Runtime config loading is env-first, with `tokens.py` kept as a local-development fallback.
 - Database schema changes should continue to go through Alembic via `python -m maxogram db-upgrade`.
-- The full runtime and table reference lives in [architecture.md](/C:/Users/LA/YandexDisk/Coding/Maxogram/architecture.md).
+- The full runtime and schema reference lives in `architecture.md`.

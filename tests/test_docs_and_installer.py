@@ -18,6 +18,9 @@ def test_readme_uses_public_installer_url_and_modes() -> None:
     assert "generic Linux best-effort fallback" in readme
     assert "systemd timer" in readme
     assert ">= 3.13" in readme
+    assert "working virtual environment with `pip`" in readme
+    assert "pythonX.Y-venv" in readme
+    assert "python3-venv" in readme
     assert "database name: `maxogram`" in readme
     assert "maxogram_app" in readme
     assert "GitHub tarball" in readme
@@ -63,3 +66,8 @@ def test_install_script_uses_real_cli_and_tarball_update_flow() -> None:
     assert "pg_lsclusters" in installer
     assert "postmaster.pid" in installer
     assert "Could not discover a live local PostgreSQL target" in installer
+    assert "python_can_create_working_venv" in installer
+    assert "python3-venv" in installer
+    assert "Trying Debian/Ubuntu venv package repair" in installer
+    assert "Falling back to source-built Python" in installer
+    assert '-m pip install --upgrade pip setuptools wheel' in installer

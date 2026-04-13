@@ -94,7 +94,9 @@ Update mode:
 - creates or reuses the local PostgreSQL role, database, and schema when PostgreSQL is local
 - reuses existing Maxogram data and applies only `python -m maxogram db-upgrade`
 - creates or reuses the dedicated `maxogram` system user
-- uses any system Python `>= 3.13`, otherwise tries distro packages, otherwise builds Python `3.13` from source
+- uses a Python `>= 3.13` only when it can successfully create a working virtual environment with `pip`
+- on Debian/Ubuntu, may install the matching `pythonX.Y-venv` package or `python3-venv` automatically when the interpreter exists but `venv` support is missing
+- otherwise tries distro packages first and falls back to building Python `3.13` from source
 - creates or upgrades `.venv`
 - installs or upgrades Python dependencies
 - writes `/etc/maxogram/maxogram.env`

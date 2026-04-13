@@ -18,6 +18,7 @@ APP_SOURCE_LABEL="GitHub tarball (main)"
 
 PYTHON_FALLBACK_VERSION="3.13.0"
 PYTHON_EXEC=""
+PYTHON_VENV_READY="false"
 PYTHON_MIN_MAJOR="3"
 PYTHON_MIN_MINOR="13"
 
@@ -1433,6 +1434,16 @@ sys.exit(0 if sys.version_info >= (required_major, required_minor) else 1)
 PY
 }
 
+python_version_series() {
+  local python_exec="$1"
+
+  "${python_exec}" - <<'PY'
+import sys
+
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+}
+
 discover_python_exec() {
   local candidate
   local resolved
@@ -1456,6 +1467,90 @@ discover_python_exec() {
   return 1
 }
 
+python_can_create_working_venv() {
+  local python_exec="$1"
+  local probe_dir=""
+  local probe_python=""
+  local status=0
+
+  probe_dir="$(mktemp -d "/tmp/${APP_NAME}-venv-probe-XXXXXX")"
+  probe_python="${probe_dir}/bin/python"
+
+  if ! "${python_exec}" -m venv "${probe_dir}" >/dev/null 2>&1; then
+    status=1
+  elif ! "${probe_python}" -m pip --version >/dev/null 2>&1; then
+    status=1
+  fi
+
+  rm -rf "${probe_dir}"
+  return "${status}"
+}
+
+try_debian_python_venv_repair() {
+  local python_exec="$1"
+  local version_series=""
+  local package=""
+  local seen=" "
+  local -a repair_packages=()
+
+  if [[ "${PKG_MANAGER}" != "apt" || "${python_exec}" != /usr/bin/* ]]; then
+    return 1
+  fi
+
+  version_series="$(python_version_series "${python_exec}" 2>/dev/null || true)"
+  log "Trying Debian/Ubuntu venv package repair for ${python_exec}."
+
+  if [[ -n "${version_series}" ]]; then
+    repair_packages+=("python${version_series}-venv")
+  fi
+  repair_packages+=("python3-venv")
+
+  for package in "${repair_packages[@]}"; do
+    if [[ "${seen}" == *" ${package} "* ]]; then
+      continue
+    fi
+    seen="${seen}${package} "
+    log "Attempting to install ${package}..."
+    if try_install_packages "${package}"; then
+      if python_can_create_working_venv "${python_exec}"; then
+        return 0
+      fi
+      warn "Installed ${package}, but ${python_exec} still cannot create a working virtual environment."
+    fi
+  done
+
+  return 1
+}
+
+select_python_exec_if_ready() {
+  local python_exec="$1"
+  local source_label="$2"
+  local version_series=""
+
+  version_series="$(python_version_series "${python_exec}" 2>/dev/null || true)"
+  if [[ -z "${version_series}" ]]; then
+    version_series="unknown"
+  fi
+
+  log "Found Python ${version_series} at ${python_exec}."
+  if python_can_create_working_venv "${python_exec}"; then
+    PYTHON_EXEC="${python_exec}"
+    PYTHON_VENV_READY="true"
+    log "Using ${source_label} Python at ${python_exec}."
+    return 0
+  fi
+
+  warn "Python ${version_series} at ${python_exec} cannot create working virtual environments."
+  if try_debian_python_venv_repair "${python_exec}"; then
+    PYTHON_EXEC="${python_exec}"
+    PYTHON_VENV_READY="true"
+    log "Using repaired Python ${version_series} at ${python_exec}."
+    return 0
+  fi
+
+  return 1
+}
+
 install_python_build_dependencies() {
   if [[ "${#BUILD_DEP_PACKAGE_GROUPS[@]}" -eq 0 ]]; then
     warn "No known build-dependency set for this distro. Python source build will rely on existing build tools."
@@ -1465,26 +1560,7 @@ install_python_build_dependencies() {
   install_from_candidate_groups "Python build dependencies" "${BUILD_DEP_PACKAGE_GROUPS[@]}" || true
 }
 
-ensure_python() {
-  export PATH="/usr/local/bin:${PATH}"
-
-  if PYTHON_EXEC="$(discover_python_exec)"; then
-    log "Using system Python at ${PYTHON_EXEC}."
-    return 0
-  fi
-
-  log "Trying to install a Python interpreter >= 3.13 from OS packages..."
-  if [[ "${#PYTHON_PACKAGE_GROUPS[@]}" -gt 0 ]]; then
-    install_from_candidate_groups "Python >= 3.13" "${PYTHON_PACKAGE_GROUPS[@]}" || true
-    if PYTHON_EXEC="$(discover_python_exec)"; then
-      log "Using packaged Python at ${PYTHON_EXEC}."
-      return 0
-    fi
-  else
-    warn "No package-manager recipe is available for Python on this distro."
-  fi
-
-  warn "A suitable Python >= 3.13 is not available from packages; building Python ${PYTHON_FALLBACK_VERSION} from source."
+build_python_from_source() {
   install_python_build_dependencies
 
   local build_root="/tmp/${APP_NAME}-python-build"
@@ -1511,26 +1587,62 @@ ensure_python() {
     make -j"${jobs}"
     make altinstall
   )
+}
 
-  PYTHON_EXEC="$(discover_python_exec || true)"
-  [[ -n "${PYTHON_EXEC}" ]] || die "Python build finished, but no interpreter >= 3.13 is available."
+ensure_python() {
+  local discovered_python=""
+
+  export PATH="/usr/local/bin:${PATH}"
+  PYTHON_VENV_READY="false"
+
+  discovered_python="$(discover_python_exec || true)"
+  if [[ -n "${discovered_python}" ]] && select_python_exec_if_ready "${discovered_python}" "system"; then
+    return 0
+  fi
+
+  log "Trying to install a Python interpreter >= 3.13 from OS packages..."
+  if [[ "${#PYTHON_PACKAGE_GROUPS[@]}" -gt 0 ]]; then
+    install_from_candidate_groups "Python >= 3.13" "${PYTHON_PACKAGE_GROUPS[@]}" || true
+    discovered_python="$(discover_python_exec || true)"
+    if [[ -n "${discovered_python}" ]] && select_python_exec_if_ready "${discovered_python}" "packaged"; then
+      return 0
+    fi
+  else
+    warn "No package-manager recipe is available for Python on this distro."
+  fi
+
+  warn "Falling back to source-built Python ${PYTHON_FALLBACK_VERSION} because no discovered interpreter could create a working virtual environment."
+  build_python_from_source
+
+  discovered_python="$(discover_python_exec || true)"
+  [[ -n "${discovered_python}" ]] || die "Python build finished, but no interpreter >= 3.13 is available."
+  if ! select_python_exec_if_ready "${discovered_python}" "source-built"; then
+    die "Python build finished, but ${discovered_python} still cannot create a working virtual environment."
+  fi
 }
 
 ensure_virtualenv() {
   local venv_python="${APP_DIR}/.venv/bin/python"
-  local venv_pip="${APP_DIR}/.venv/bin/pip"
+
+  if [[ "${PYTHON_VENV_READY}" != "true" ]] && ! python_can_create_working_venv "${PYTHON_EXEC}"; then
+    die "Python interpreter ${PYTHON_EXEC} was found, but it cannot create a working virtual environment with pip support."
+  fi
 
   if [[ -d "${APP_DIR}/.venv" ]]; then
     log "Upgrading existing virtual environment..."
-    run_as_app "${PYTHON_EXEC}" -m venv --upgrade "${APP_DIR}/.venv"
+    if ! run_as_app "${PYTHON_EXEC}" -m venv --upgrade "${APP_DIR}/.venv"; then
+      die "Python interpreter ${PYTHON_EXEC} was selected, but it could not create a seeded virtual environment in ${APP_DIR}/.venv."
+    fi
   else
     log "Creating virtual environment in ${APP_DIR}/.venv..."
-    run_as_app "${PYTHON_EXEC}" -m venv "${APP_DIR}/.venv"
+    if ! run_as_app "${PYTHON_EXEC}" -m venv "${APP_DIR}/.venv"; then
+      die "Python interpreter ${PYTHON_EXEC} was selected, but it could not create a seeded virtual environment in ${APP_DIR}/.venv."
+    fi
   fi
 
   run_as_app "${venv_python}" -m ensurepip --upgrade
-  run_as_app "${venv_pip}" install --upgrade pip setuptools wheel
-  run_as_app "${venv_pip}" install --upgrade -r "${APP_DIR}/requirements.txt"
+  run_as_app "${venv_python}" -m pip install --upgrade pip setuptools wheel
+  run_as_app "${venv_python}" -m pip install --upgrade -r "${APP_DIR}/requirements.txt"
 }
 
 ensure_database_role_and_db() {

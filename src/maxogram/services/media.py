@@ -63,6 +63,7 @@ def _telegram_media_plan(message: dict[str, Any]) -> MediaPlan:
         return _telegram_animation_plan(animation)
 
     for key, kind, text_hint, fallback_name, fallback_mime in (
+        ("video_note", MediaKind.VIDEO, "[video note]", "video_note.mp4", "video/mp4"),
         ("video", MediaKind.VIDEO, "[video]", "video.mp4", "video/mp4"),
         (
             "document",

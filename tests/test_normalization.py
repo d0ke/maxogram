@@ -704,6 +704,36 @@ def test_normalize_telegram_mp4_animation_uses_video_kind():
     assert media["payload"]["identity"] == "telegram:video:id:anim-id"
 
 
+def test_normalize_telegram_video_note_is_relayable_video():
+    normalized = normalize_update(
+        Platform.TELEGRAM,
+        {
+            "update_id": 113,
+            "message": {
+                "message_id": 213,
+                "date": 1_700_000_000,
+                "chat": {"id": -100},
+                "from": {"id": 42, "first_name": "Alice", "is_bot": False},
+                "video_note": {
+                    "file_id": "video-note-id",
+                    "file_unique_id": "video-note-unique-id",
+                    "file_size": 2048,
+                },
+            },
+        },
+    )
+
+    assert normalized is not None
+    media = _media_payload(normalized.payload)
+    assert media["supported"] is True
+    assert media["kind"] == "video"
+    assert media["text_hint"] == "[video note]"
+    assert media["payload"]["filename"] == "video_note.mp4"
+    assert media["payload"]["mime_type"] == "video/mp4"
+    assert media["payload"]["source"]["file_id"] == "video-note-id"
+    assert media["payload"]["identity"] == "telegram:video:id:video-note-unique-id"
+
+
 def test_normalize_telegram_oversized_video_uses_explicit_limit_hint():
     normalized = normalize_update(
         Platform.TELEGRAM,

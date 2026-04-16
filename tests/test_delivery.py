@@ -848,6 +848,52 @@ async def test_delivery_sends_telegram_mp4_animation_to_max_as_video_media(
 
 
 @pytest.mark.asyncio
+async def test_delivery_sends_telegram_video_note_to_max_as_video_media(
+    tmp_path: Path,
+):
+    telegram = FakeClient("telegram", download_kind=MediaKind.VIDEO)
+    max_client = FakeClient("max")
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+    )
+    context = make_context(
+        action="send",
+        bridge_id=uuid.uuid4(),
+        dst_platform=Platform.MAX,
+        task_payload={
+            "src": {
+                "platform": "telegram",
+                "chat_id": "-100",
+                "message_id": "video-note-1",
+            },
+            "dst": {"platform": "max", "chat_id": "200"},
+            "text": "Alice:",
+            "fallback_text": "Alice: [video note]",
+            "has_media": True,
+            "media_kind": "video",
+            "media": media_payload(
+                source_platform=Platform.TELEGRAM,
+                kind="video",
+                identity="telegram:video:id:video-note-id",
+                source={"file_id": "video-note-id"},
+            ),
+        },
+    )
+
+    await worker._call_platform(context)
+
+    assert len(telegram.download_calls) == 1
+    assert len(max_client.send_message_calls) == 1
+    assert max_client.send_message_calls[0]["text"] == "Alice:"
+    assert max_client.send_message_calls[0]["media"] is not None
+    assert max_client.send_message_calls[0]["media"].kind == MediaKind.VIDEO
+
+
+@pytest.mark.asyncio
 async def test_delivery_sends_max_opaque_gif_to_telegram_via_animation_path(
     tmp_path: Path,
 ):

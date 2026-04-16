@@ -18,6 +18,8 @@
   - Telegram media sends that use the same safe fallback path
   - delivery-worker success finalization and mapping creation when Telegram result serialization falls back
   - `MAX -> Telegram` send-plus-later-edit flow so pending edits replay once after mapping creation without repeated send retries or expired pending mutations
+- Restored `Telegram -> MAX` relay for Telegram `video_note` messages by classifying them as supported inbound video media instead of letting them degrade to `"[unsupported message]"`.
+- Added regression coverage for Telegram `video_note` normalization and delivery so round-video messages now download from Telegram and upload to MAX through the existing video pipeline.
 
 ## 2026-04-10
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -188,6 +189,66 @@ async def test_send_message_uses_html_parse_mode_for_formatted_text() -> None:
     assert len(bot.send_message_calls) == 1
     assert bot.send_message_calls[0]["text"] == "Alice: <b>plain</b>"
     assert bot.send_message_calls[0]["parse_mode"] == "HTML"
+
+
+@pytest.mark.asyncio
+async def test_send_message_succeeds_when_result_serialization_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bot = FakeBot()
+    client = make_client(bot)
+
+    def fail_serialize(message: object) -> object:
+        _ = message
+        raise TypeError("boom")
+
+    monkeypatch.setattr(
+        "maxogram.platforms.telegram.deserialize_telegram_object_to_python",
+        fail_serialize,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = await client.send_message("-100", "Alice: plain")
+
+    assert result.message_id == "100"
+    assert result.raw == {"message_id": 100}
+    assert len(bot.send_message_calls) == 1
+    assert "Falling back to minimal Telegram send result serialization" in caplog.text
+    assert "chat_id=-100" in caplog.text
+    assert "message_id=100" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_send_media_succeeds_when_result_serialization_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    bot = FakeBot()
+    client = make_client(bot)
+    file_path = tmp_path / "party.jpg"
+    file_path.write_bytes(b"jpg")
+    media = LocalMediaFile(
+        kind=MediaKind.IMAGE,
+        path=file_path,
+        filename="party.jpg",
+        mime_type="image/jpeg",
+    )
+
+    def fail_serialize(message: object) -> object:
+        _ = message
+        raise TypeError("boom")
+
+    monkeypatch.setattr(
+        "maxogram.platforms.telegram.deserialize_telegram_object_to_python",
+        fail_serialize,
+    )
+
+    result = await client.send_message("-100", "Alice:", media=media)
+
+    assert result.message_id == "102"
+    assert result.raw == {"message_id": 102}
+    assert len(bot.send_photo_calls) == 1
 
 
 @pytest.mark.asyncio

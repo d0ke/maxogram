@@ -155,10 +155,13 @@ class TelegramClient:
                 retryable=_is_retryable_telegram(exc),
                 code=exc.__class__.__name__,
             ) from exc
-        raw: dict[str, Any] = message.model_dump(
-            mode="json", by_alias=True, exclude_none=True
+        message_id = str(message.message_id)
+        raw = _serialize_sent_message(
+            message,
+            chat_id=chat_id,
+            message_id=message_id,
         )
-        return SendResult(message_id=str(message.message_id), raw=raw)
+        return SendResult(message_id=message_id, raw=raw)
 
     async def edit_message(
         self,
@@ -468,3 +471,37 @@ def _media_presentation(value: object) -> MediaPresentation | None:
 
 def _is_retryable_telegram(exc: TelegramAPIError) -> bool:
     return not isinstance(exc, TelegramForbiddenError)
+
+
+def _serialize_sent_message(
+    message: Any,
+    *,
+    chat_id: str,
+    message_id: str,
+) -> dict[str, Any]:
+    try:
+        raw = deserialize_telegram_object_to_python(message)
+    except Exception as exc:
+        logger.warning(
+            "Falling back to minimal Telegram send result serialization "
+            "chat_id=%s message_id=%s error=%s: %s",
+            chat_id,
+            message_id,
+            exc.__class__.__name__,
+            exc,
+        )
+        return _minimal_message_raw(message_id)
+    if isinstance(raw, dict):
+        return raw
+    logger.warning(
+        "Falling back to minimal Telegram send result serialization "
+        "chat_id=%s message_id=%s payload_type=%s",
+        chat_id,
+        message_id,
+        type(raw).__name__,
+    )
+    return _minimal_message_raw(message_id)
+
+
+def _minimal_message_raw(message_id: str) -> dict[str, Any]:
+    return {"message_id": int(message_id)}

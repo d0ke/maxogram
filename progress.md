@@ -9,6 +9,16 @@
 - Schema and migrations: one Alembic revision, `20260410_0001`, creates the current SQLAlchemy metadata; there are no later incremental migrations yet.
 - Test coverage: automated tests cover config loading, deduplication, commands, normalization, rendering, pollers, delivery, reconciliation, platform clients, and optional database connectivity.
 
+## 2026-04-16
+
+- Fixed `MAX -> Telegram` duplicate resend storms that happened after Telegram had already accepted a send but local result serialization failed, which previously caused delivery retries, duplicate Telegram messages, and missing `message_mappings`.
+- Reworked Telegram send-result handling to capture the successful `message_id` first, serialize returned Telegram `Message` objects through aiogram's safe serializer, and fall back to a minimal raw payload with a warning log instead of converting post-success serialization issues into retryable delivery failures.
+- Added regression coverage for:
+  - Telegram text sends that succeed even when post-send result serialization fails
+  - Telegram media sends that use the same safe fallback path
+  - delivery-worker success finalization and mapping creation when Telegram result serialization falls back
+  - `MAX -> Telegram` send-plus-later-edit flow so pending edits replay once after mapping creation without repeated send retries or expired pending mutations
+
 ## 2026-04-10
 
 - Built the initial bridge application skeleton: repository-root entrypoint, CLI commands, local configuration loading, async app lifecycle, SQLAlchemy models, Alembic setup, repositories, worker loops, platform adapters, and baseline tests.

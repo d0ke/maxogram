@@ -192,6 +192,9 @@ class DeliveryState:
     created_payloads: dict[
         tuple[uuid.UUID, Platform, str, str], dict[str, Any]
     ] = field(default_factory=dict)
+    pending_rows: list[Any] = field(default_factory=list)
+    canonical_event_ids: dict[str, uuid.UUID] = field(default_factory=dict)
+    bridge_chats: dict[tuple[uuid.UUID, Platform], Any] = field(default_factory=dict)
     mappings: list[dict[str, Any]] = field(default_factory=list)
     attempts: list[dict[str, Any]] = field(default_factory=list)
     dead_letters: list[dict[str, Any]] = field(default_factory=list)
@@ -387,6 +390,79 @@ class FakeRepository:
         )
         return True
 
+    async def find_mapping_by_source(
+        self,
+        bridge_id: uuid.UUID,
+        src_platform: Platform,
+        src_chat_id: str,
+        src_message_id: str,
+    ) -> Any | None:
+        for mapping in self.state.mappings:
+            if (
+                mapping["bridge_id"] == bridge_id
+                and mapping["src_platform"] == src_platform
+                and mapping["src_chat_id"] == src_chat_id
+                and mapping["src_message_id"] == src_message_id
+            ):
+                return SimpleNamespace(**mapping)
+        return None
+
+    async def find_canonical_event_id_by_dedup_key(
+        self,
+        dedup_key: str,
+    ) -> uuid.UUID | None:
+        return self.state.canonical_event_ids.get(dedup_key)
+
+    async def find_other_chat(
+        self,
+        bridge_id: uuid.UUID,
+        source_platform: Platform,
+    ) -> Any | None:
+        return self.state.bridge_chats.get((bridge_id, source_platform))
+
+    async def enqueue_outbox(self, **kwargs: Any) -> uuid.UUID:
+        partition = str(kwargs["partition_key"])
+        seq = (
+            max(
+                (
+                    task.seq
+                    for task in self.state.tasks.values()
+                    if task.partition_key == partition
+                ),
+                default=0,
+            )
+            + 1
+        )
+        outbox_id = uuid.uuid4()
+        self.state.tasks[outbox_id] = SimpleNamespace(
+            outbox_id=outbox_id,
+            bridge_id=kwargs["bridge_id"],
+            dedup_key=kwargs["dedup_key"],
+            src_event_id=kwargs["src_event_id"],
+            action=kwargs["action"].value,
+            task=kwargs["task"],
+            dst_platform=kwargs["dst_platform"],
+            partition_key=partition,
+            seq=seq,
+            status=TaskStatus.READY,
+            attempt_count=0,
+            next_attempt_at=datetime.now(UTC),
+            inflight_until=None,
+        )
+        return outbox_id
+
+    async def mark_pending_mutation_done(self, pending: Any) -> None:
+        pending.status = TaskStatus.DONE
+
+    async def reschedule_pending_mutation(
+        self,
+        pending: Any,
+        *,
+        next_attempt_at: datetime,
+    ) -> None:
+        pending.status = TaskStatus.RETRY_WAIT
+        pending.next_attempt_at = next_attempt_at
+
     async def reset_expired_inflight(self) -> int:
         now = datetime.now(UTC)
         reset = 0
@@ -399,11 +475,32 @@ class FakeRepository:
         return reset
 
     async def claim_pending_mutations(self, limit: int) -> list[Any]:
-        _ = limit
-        return []
+        now = datetime.now(UTC)
+        rows = [
+            pending
+            for pending in self.state.pending_rows
+            if pending.status == TaskStatus.RETRY_WAIT
+            and pending.next_attempt_at <= now
+            and pending.expires_at > now
+        ]
+        return rows[:limit]
 
     async def expire_pending_mutations(self) -> int:
-        return 0
+        now = datetime.now(UTC)
+        expired = 0
+        for pending in self.state.pending_rows:
+            if pending.status == TaskStatus.RETRY_WAIT and pending.expires_at <= now:
+                pending.status = TaskStatus.DEAD
+                self.state.dead_letters.append(
+                    {
+                        "bridge_id": pending.bridge_id,
+                        "outbox_id": None,
+                        "reason": "missing_mapping_after_3m",
+                        "payload": pending.payload,
+                    }
+                )
+                expired += 1
+        return expired
 
 
 def make_worker(
@@ -472,6 +569,31 @@ def make_task(
     )
 
 
+def make_pending_mutation(
+    *,
+    bridge_id: uuid.UUID,
+    dedup_key: str,
+    src_platform: Platform,
+    src_chat_id: str,
+    src_message_id: str,
+    mutation_type: str,
+    payload: dict[str, Any],
+) -> Any:
+    return SimpleNamespace(
+        pending_id=uuid.uuid4(),
+        bridge_id=bridge_id,
+        dedup_key=dedup_key,
+        src_platform=src_platform,
+        src_chat_id=src_chat_id,
+        src_message_id=src_message_id,
+        mutation_type=mutation_type,
+        payload=payload,
+        status=TaskStatus.RETRY_WAIT,
+        next_attempt_at=datetime.now(UTC),
+        expires_at=datetime.now(UTC) + timedelta(minutes=3),
+    )
+
+
 def media_payload(
     *,
     source_platform: Platform,
@@ -517,10 +639,16 @@ class FakeTelegramMessage:
 
 class DeliveryTelegramBot:
     def __init__(self) -> None:
+        self.send_message_calls: list[dict[str, object]] = []
         self.send_animation_calls: list[dict[str, object]] = []
         self.send_photo_calls: list[dict[str, object]] = []
         self.edit_message_caption_calls: list[dict[str, object]] = []
+        self.edit_message_text_calls: list[dict[str, object]] = []
         self.edit_message_media_calls: list[dict[str, object]] = []
+
+    async def send_message(self, **kwargs: object) -> FakeTelegramMessage:
+        self.send_message_calls.append(dict(kwargs))
+        return FakeTelegramMessage(5000, "message")
 
     async def send_animation(self, **kwargs: object) -> FakeTelegramMessage:
         self.send_animation_calls.append(dict(kwargs))
@@ -533,6 +661,10 @@ class DeliveryTelegramBot:
     async def edit_message_caption(self, **kwargs: object) -> FakeTelegramMessage:
         self.edit_message_caption_calls.append(dict(kwargs))
         return FakeTelegramMessage(5003, "caption")
+
+    async def edit_message_text(self, **kwargs: object) -> FakeTelegramMessage:
+        self.edit_message_text_calls.append(dict(kwargs))
+        return FakeTelegramMessage(5005, "text")
 
     async def edit_message_media(self, **kwargs: object) -> FakeTelegramMessage:
         self.edit_message_media_calls.append(dict(kwargs))
@@ -1453,3 +1585,167 @@ async def test_delivery_skips_stale_success_finalization(
     assert state.tasks[task.outbox_id].attempt_count == 99
     assert state.attempts == []
     assert state.mappings == []
+
+
+@pytest.mark.asyncio
+async def test_delivery_finalizes_success_when_telegram_result_serialization_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    task = make_task(
+        action="send",
+        bridge_id=uuid.uuid4(),
+        dst_platform=Platform.TELEGRAM,
+        task_payload={
+            "src": {"platform": "max", "chat_id": "300", "message_id": "mid-link"},
+            "dst": {"platform": "telegram", "chat_id": "-100"},
+            "text_plain": "Alice: https://example.test",
+            "text_html": (
+                'Alice: <a href="https://example.test">https://example.test</a>'
+            ),
+            "fallback_text": "Alice: https://example.test",
+            "has_media": False,
+            "media_kind": None,
+            "media": None,
+        },
+    )
+    state = DeliveryState(tasks={task.outbox_id: task})
+    database = FakeDatabase(state)
+    telegram_bot = DeliveryTelegramBot()
+    telegram = object.__new__(TelegramClient)
+    telegram.bot = cast(Any, telegram_bot)
+    max_client = FakeClient("max", state=state)
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: cast(Any, telegram),
+            Platform.MAX: max_client,
+        },
+        database=database,
+    )
+
+    def fail_serialize(message: object) -> object:
+        _ = message
+        raise TypeError("boom")
+
+    monkeypatch.setattr("maxogram.workers.delivery.Repository", FakeRepository)
+    monkeypatch.setattr(
+        "maxogram.platforms.telegram.deserialize_telegram_object_to_python",
+        fail_serialize,
+    )
+
+    processed = await worker.run_once()
+
+    assert processed == 1
+    assert len(telegram_bot.send_message_calls) == 1
+    assert state.tasks[task.outbox_id].status == TaskStatus.DONE
+    assert state.dead_letters == []
+    assert state.attempts == [
+        {
+            "outbox_id": task.outbox_id,
+            "attempt_no": 1,
+            "outcome": DeliveryOutcome.SUCCESS,
+        }
+    ]
+    assert len(state.mappings) == 1
+    assert state.mappings[0]["dst_message_id"] == "5000"
+
+
+@pytest.mark.asyncio
+async def test_max_link_send_then_edit_replays_once_without_duplicate_send(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    bridge_id = uuid.uuid4()
+    send_task = make_task(
+        action="send",
+        bridge_id=bridge_id,
+        dst_platform=Platform.TELEGRAM,
+        task_payload={
+            "src": {"platform": "max", "chat_id": "300", "message_id": "mid-link"},
+            "dst": {"platform": "telegram", "chat_id": "-100"},
+            "text_plain": "Alice: https://example.test",
+            "text_html": (
+                'Alice: <a href="https://example.test">https://example.test</a>'
+            ),
+            "fallback_text": "Alice: https://example.test",
+            "has_media": False,
+            "media_kind": None,
+            "media": None,
+        },
+    )
+    edit_dedup_key = "max:300:mid-link:message.edited:edit-1"
+    pending = make_pending_mutation(
+        bridge_id=bridge_id,
+        dedup_key=edit_dedup_key,
+        src_platform=Platform.MAX,
+        src_chat_id="300",
+        src_message_id="mid-link",
+        mutation_type="edit",
+        payload={
+            "src": {"platform": "max", "chat_id": "300", "message_id": "mid-link"},
+            "dst": {"platform": "telegram", "chat_id": "-100"},
+            "text_plain": "Alice: updated https://example.test",
+            "text_html": (
+                'Alice: <b>updated</b> '
+                '<a href="https://example.test">https://example.test</a>'
+            ),
+            "fallback_text": "Alice: updated https://example.test",
+            "has_media": False,
+            "media_kind": None,
+            "media": None,
+            "version": "edit-1",
+        },
+    )
+    state = DeliveryState(
+        tasks={send_task.outbox_id: send_task},
+        pending_rows=[pending],
+        canonical_event_ids={edit_dedup_key: uuid.uuid4()},
+    )
+    database = FakeDatabase(state)
+    telegram_bot = DeliveryTelegramBot()
+    telegram = object.__new__(TelegramClient)
+    telegram.bot = cast(Any, telegram_bot)
+    max_client = FakeClient("max", state=state)
+    delivery = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: cast(Any, telegram),
+            Platform.MAX: max_client,
+        },
+        database=database,
+    )
+    reconciliation = ReconciliationWorker(
+        database=database,  # type: ignore[arg-type]
+        stop_event=asyncio.Event(),
+        idle_seconds=0,
+    )
+
+    def fail_serialize(message: object) -> object:
+        _ = message
+        raise TypeError("boom")
+
+    monkeypatch.setattr("maxogram.workers.delivery.Repository", FakeRepository)
+    monkeypatch.setattr("maxogram.workers.reconciliation.Repository", FakeRepository)
+    monkeypatch.setattr(
+        "maxogram.platforms.telegram.deserialize_telegram_object_to_python",
+        fail_serialize,
+    )
+
+    processed_send = await delivery.run_once()
+    reset, replayed, expired = await reconciliation.run_once()
+    processed_edit = await delivery.run_once()
+
+    assert processed_send == 1
+    assert processed_edit == 1
+    assert reset == 0
+    assert replayed == 1
+    assert expired == 0
+    assert pending.status == TaskStatus.DONE
+    assert len(telegram_bot.send_message_calls) == 1
+    assert len(telegram_bot.edit_message_text_calls) == 1
+    assert state.dead_letters == []
+    assert [attempt["outcome"] for attempt in state.attempts] == [
+        DeliveryOutcome.SUCCESS,
+        DeliveryOutcome.SUCCESS,
+    ]

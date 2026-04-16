@@ -174,6 +174,35 @@ def make_normalized(
     )
 
 
+def make_supported_media_payload(
+    kind: str,
+    *,
+    source_platform: str = "telegram",
+    text_hint: str | None = None,
+) -> dict[str, Any]:
+    resolved_text_hint = text_hint or f"[{kind}]"
+    source = (
+        {"file_id": "file-id"}
+        if source_platform == "telegram"
+        else {"url": f"https://example.invalid/{kind}.bin"}
+    )
+    return {
+        "media": {
+            "supported": True,
+            "kind": kind,
+            "text_hint": resolved_text_hint,
+            "payload": {
+                "source_platform": source_platform,
+                "kind": kind,
+                "placeholder": resolved_text_hint,
+                "filename": f"{kind}.bin",
+                "identity": f"{source_platform}:{kind}:id:file-id",
+                "source": source,
+            },
+        }
+    }
+
+
 @pytest.mark.asyncio
 async def test_build_payload_replies_to_destination_mapping_for_local_source_message():
     bridge_id = uuid.uuid4()
@@ -320,6 +349,81 @@ async def test_build_payload_uses_media_caption_and_fallback_text():
     media = cast(dict[str, Any], payload["media"])
     assert media["source"]["file_id"] == "file-id"
     assert media["identity"] == "telegram:image:id:file-id"
+
+
+@pytest.mark.asyncio
+async def test_build_payload_uses_audio_label_for_telegram_audio_caption():
+    bridge_id = uuid.uuid4()
+    repo = FakeRepository()
+    worker = make_worker()
+
+    payload = await worker._build_payload(
+        repo,
+        make_normalized(
+            Platform.TELEGRAM,
+            chat_id="-100",
+            message_id="202-audio",
+            text="caption",
+            formatted_html="<b>caption</b>",
+            payload=make_supported_media_payload("audio"),
+        ),
+        bridge_id,
+    )
+
+    assert payload["text_plain"] == "🔊 Alice\ncaption"
+    assert payload["text_html"] == "🔊 Alice\n<b>caption</b>"
+    assert payload["fallback_text"] == "🔊 Alice\ncaption"
+    assert payload["media_kind"] == "audio"
+
+
+@pytest.mark.asyncio
+async def test_build_payload_uses_audio_label_for_telegram_voice_without_text():
+    bridge_id = uuid.uuid4()
+    repo = FakeRepository()
+    worker = make_worker()
+
+    payload = await worker._build_payload(
+        repo,
+        make_normalized(
+            Platform.TELEGRAM,
+            chat_id="-100",
+            message_id="203-voice",
+            text=None,
+            payload=make_supported_media_payload("voice"),
+        ),
+        bridge_id,
+    )
+
+    assert payload["text_plain"] == "🔊 Alice"
+    assert payload["text_html"] is None
+    assert payload["fallback_text"] == "🔊 Alice"
+    assert payload["media_kind"] == "voice"
+
+
+@pytest.mark.asyncio
+async def test_build_payload_uses_audio_label_for_max_audio_caption():
+    bridge_id = uuid.uuid4()
+    repo = FakeRepository()
+    worker = make_worker()
+
+    payload = await worker._build_payload(
+        repo,
+        make_normalized(
+            Platform.MAX,
+            chat_id="100",
+            message_id="mid-audio",
+            text="listen",
+            payload=make_supported_media_payload(
+                "audio",
+                source_platform="max",
+            ),
+        ),
+        bridge_id,
+    )
+
+    assert payload["text_plain"] == "🔊 Alice\nlisten"
+    assert payload["fallback_text"] == "🔊 Alice\nlisten"
+    assert payload["media_kind"] == "audio"
 
 
 @pytest.mark.asyncio

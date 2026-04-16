@@ -28,6 +28,8 @@ from maxogram.services.dedup import outbox_dedup_key, partition_key
 from maxogram.services.normalization import NormalizedUpdate, normalize_update
 from maxogram.services.rendering import (
     default_alias,
+    render_audio_caption,
+    render_audio_caption_html,
     render_media_caption,
     render_media_caption_html,
     render_mirror_html,
@@ -218,33 +220,62 @@ class NormalizerWorker:
             normalized,
         )
         media = _supported_media_payload(normalized.payload)
+        media_kind = (
+            str(media.get("kind"))
+            if media is not None and media.get("kind") is not None
+            else None
+        )
         placeholder = _media_text_hint(normalized.payload)
-        rendered_plain = (
-            render_media_caption(
+        if media is not None and media_kind in {"audio", "voice"}:
+            rendered_plain = render_audio_caption(
                 alias,
                 normalized.text,
                 forwarded=normalized.forwarded,
                 reply_hint=reply_hint,
             )
-            if media is not None
-            else render_mirror_text(
-                alias,
-                normalized.text,
-                forwarded=normalized.forwarded,
-                reply_hint=reply_hint,
-                media_hint=placeholder,
-            )
-        )
-        rendered_html = (
-            render_media_caption_html(
+            rendered_html = render_audio_caption_html(
                 alias,
                 normalized.text,
                 normalized.formatted_html,
                 forwarded=normalized.forwarded,
                 reply_hint=reply_hint,
             )
-            if media is not None
-            else render_mirror_html(
+            fallback_text = render_audio_caption(
+                alias,
+                normalized.text,
+                forwarded=normalized.forwarded,
+                reply_hint=reply_hint,
+            )
+        elif media is not None:
+            rendered_plain = render_media_caption(
+                alias,
+                normalized.text,
+                forwarded=normalized.forwarded,
+                reply_hint=reply_hint,
+            )
+            rendered_html = render_media_caption_html(
+                alias,
+                normalized.text,
+                normalized.formatted_html,
+                forwarded=normalized.forwarded,
+                reply_hint=reply_hint,
+            )
+            fallback_text = render_mirror_text(
+                alias,
+                normalized.text,
+                forwarded=normalized.forwarded,
+                reply_hint=reply_hint,
+                media_hint=placeholder,
+            )
+        else:
+            rendered_plain = render_mirror_text(
+                alias,
+                normalized.text,
+                forwarded=normalized.forwarded,
+                reply_hint=reply_hint,
+                media_hint=placeholder,
+            )
+            rendered_html = render_mirror_html(
                 alias,
                 normalized.text,
                 normalized.formatted_html,
@@ -252,14 +283,13 @@ class NormalizerWorker:
                 reply_hint=reply_hint,
                 media_hint=placeholder,
             )
-        )
-        fallback_text = render_mirror_text(
-            alias,
-            normalized.text,
-            forwarded=normalized.forwarded,
-            reply_hint=reply_hint,
-            media_hint=placeholder,
-        )
+            fallback_text = render_mirror_text(
+                alias,
+                normalized.text,
+                forwarded=normalized.forwarded,
+                reply_hint=reply_hint,
+                media_hint=placeholder,
+            )
         return {
             "src": {
                 "platform": identity.platform.value,
@@ -274,7 +304,7 @@ class NormalizerWorker:
             "reply_to_message_id": reply_to_dst_id,
             "raw": normalized.payload or {},
             "has_media": media is not None,
-            "media_kind": media.get("kind") if media is not None else None,
+            "media_kind": media_kind,
             "media": media,
             "version": normalized.event_version,
         }

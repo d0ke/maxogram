@@ -5,6 +5,8 @@ import pytest
 from maxogram.domain import Platform, UserIdentity
 from maxogram.services.rendering import (
     default_alias,
+    render_audio_caption,
+    render_audio_caption_html,
     render_media_caption,
     render_media_caption_html,
     render_mirror_html,
@@ -52,6 +54,21 @@ def test_render_media_caption_uses_alias_only_for_empty_media_text():
     assert rendered == "[forwarded]\n[reply to 123]\nAlice:"
 
 
+def test_render_audio_caption_uses_audio_label_and_preserves_prefixes():
+    rendered = render_audio_caption(
+        "Alice",
+        None,
+        forwarded=True,
+        reply_hint="123",
+    )
+    assert rendered == "[forwarded]\n[reply to 123]\n🔊 Alice"
+
+
+def test_render_audio_caption_appends_text_on_next_line():
+    rendered = render_audio_caption("Alice", "listen")
+    assert rendered == "🔊 Alice\nlisten"
+
+
 def test_render_mirror_html_keeps_prefixes_plain_and_body_formatted():
     rendered = render_mirror_html(
         "Alice <Admin>",
@@ -65,3 +82,14 @@ def test_render_mirror_html_keeps_prefixes_plain_and_body_formatted():
 
 def test_render_media_caption_html_returns_none_without_formatted_body():
     assert render_media_caption_html("Alice", "caption", None) is None
+
+
+def test_render_audio_caption_html_keeps_prefixes_plain_and_body_formatted():
+    rendered = render_audio_caption_html(
+        "Alice <Admin>",
+        "listen",
+        "<i>listen</i>",
+        forwarded=True,
+        reply_hint="123",
+    )
+    assert rendered == "[forwarded]\n[reply to 123]\n🔊 Alice &lt;Admin&gt;\n<i>listen</i>"

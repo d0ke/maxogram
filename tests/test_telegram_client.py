@@ -38,6 +38,8 @@ class FakeBot:
         self.send_message_calls: list[dict[str, object]] = []
         self.send_animation_calls: list[dict[str, object]] = []
         self.send_photo_calls: list[dict[str, object]] = []
+        self.send_audio_calls: list[dict[str, object]] = []
+        self.send_voice_calls: list[dict[str, object]] = []
         self.edit_message_caption_calls: list[dict[str, object]] = []
         self.edit_message_text_calls: list[dict[str, object]] = []
         self.edit_message_media_calls: list[dict[str, object]] = []
@@ -79,6 +81,14 @@ class FakeBot:
     async def send_photo(self, **kwargs: object) -> FakeTelegramMessage:
         self.send_photo_calls.append(dict(kwargs))
         return FakeTelegramMessage(102, "photo")
+
+    async def send_audio(self, **kwargs: object) -> FakeTelegramMessage:
+        self.send_audio_calls.append(dict(kwargs))
+        return FakeTelegramMessage(103, "audio")
+
+    async def send_voice(self, **kwargs: object) -> FakeTelegramMessage:
+        self.send_voice_calls.append(dict(kwargs))
+        return FakeTelegramMessage(104, "voice")
 
     async def edit_message_caption(self, **kwargs: object) -> FakeTelegramMessage:
         self.edit_message_caption_calls.append(dict(kwargs))
@@ -172,6 +182,41 @@ async def test_send_message_uses_send_animation_for_animation_presentation(
     assert bot.send_photo_calls == []
     assert bot.send_animation_calls[0]["caption"] == "Alice:"
     assert result.message_id == "101"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "filename", "mime_type", "expected_call", "expected_message_id"),
+    [
+        (MediaKind.AUDIO, "track.mp3", "audio/mpeg", "send_audio_calls", "103"),
+        (MediaKind.VOICE, "voice.ogg", "audio/ogg", "send_voice_calls", "104"),
+    ],
+)
+async def test_send_message_uses_caption_for_audio_media(
+    tmp_path: Path,
+    kind: MediaKind,
+    filename: str,
+    mime_type: str,
+    expected_call: str,
+    expected_message_id: str,
+) -> None:
+    bot = FakeBot()
+    client = make_client(bot)
+    file_path = tmp_path / filename
+    file_path.write_bytes(b"audio")
+    media = LocalMediaFile(
+        kind=kind,
+        path=file_path,
+        filename=filename,
+        mime_type=mime_type,
+    )
+
+    result = await client.send_message("-100", "🔊 Alice", media=media)
+
+    call_log = cast(list[dict[str, object]], getattr(bot, expected_call))
+    assert len(call_log) == 1
+    assert call_log[0]["caption"] == "🔊 Alice"
+    assert result.message_id == expected_message_id
 
 
 @pytest.mark.asyncio

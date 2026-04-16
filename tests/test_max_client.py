@@ -164,6 +164,33 @@ async def test_send_message_uses_html_format_when_formatted_text_is_available() 
 
 
 @pytest.mark.asyncio
+async def test_send_message_with_media_keeps_text_and_attachment_in_one_request(
+    tmp_path: Path,
+) -> None:
+    client = make_client()
+    client.bot = FakeEditBot()  # type: ignore[attr-defined]
+    client.rate_limiter = cast(Any, NoopRateLimiter())  # type: ignore[attr-defined]
+    file_path = tmp_path / "track.mp3"
+    file_path.write_bytes(b"audio")
+    media = LocalMediaFile(
+        kind=MediaKind.AUDIO,
+        path=file_path,
+        filename="track.mp3",
+        mime_type="audio/mpeg",
+    )
+
+    result = await client.send_message("200", "🔊 Alice", media=media)
+
+    assert result.message_id == "mid-200"
+    assert len(client.bot.send_message_calls) == 1  # type: ignore[attr-defined]
+    send_call = client.bot.send_message_calls[0]  # type: ignore[attr-defined]
+    assert send_call["text"] == "🔊 Alice"
+    assert len(send_call["attachments"]) == 1
+    attachment = send_call["attachments"][0]
+    assert attachment.__class__.__name__ == "InputMedia"
+
+
+@pytest.mark.asyncio
 async def test_edit_message_caption_only_uses_html_format_when_available() -> None:
     client = make_client()
     client.bot = FakeEditBot()  # type: ignore[attr-defined]

@@ -20,6 +20,9 @@
   - `MAX -> Telegram` send-plus-later-edit flow so pending edits replay once after mapping creation without repeated send retries or expired pending mutations
 - Restored `Telegram -> MAX` relay for Telegram `video_note` messages by classifying them as supported inbound video media instead of letting them degrade to `"[unsupported message]"`.
 - Added regression coverage for Telegram `video_note` normalization and delivery so round-video messages now download from Telegram and upload to MAX through the existing video pipeline.
+- Changed mirrored `audio` and `voice` media labels in both directions to use `🔊 {Alias}` instead of the generic `Alias:` media prefix, while preserving forwarded/reply prefix lines and keeping any original audio caption or text on the next line.
+- Kept `Telegram -> MAX` audio relay on the existing single-message path so MAX still receives one message with both the audio attachment and the composed text body, while `MAX -> Telegram` now uses the same composed string as the mirrored caption.
+- Added regression coverage for audio-specific rendering, `Telegram -> MAX` audio and voice payload building, `MAX -> Telegram` audio payload building, Telegram audio and voice caption sends, and MAX single-request media sends that include both `text` and `attachments`.
 
 ## 2026-04-10
 

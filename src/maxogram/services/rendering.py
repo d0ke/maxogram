@@ -68,6 +68,21 @@ def render_media_caption(
     return "\n".join(chunks)
 
 
+def render_audio_caption(
+    alias: str,
+    text: str | None,
+    *,
+    forwarded: bool = False,
+    reply_hint: str | None = None,
+) -> str:
+    safe_alias = sanitize_alias(alias)
+    chunks = _render_prefix_lines(forwarded=forwarded, reply_hint=reply_hint)
+    chunks.append(f"🔊 {safe_alias}")
+    if text:
+        chunks.append(text)
+    return "\n".join(chunks)
+
+
 def render_mirror_html(
     alias: str,
     text: str | None,
@@ -100,6 +115,24 @@ def render_media_caption_html(
     safe_alias = escape_html(sanitize_alias(alias))
     chunks = _render_prefix_lines_html(forwarded=forwarded, reply_hint=reply_hint)
     chunks.append(f"{safe_alias}: {formatted_body_html}")
+    return "\n".join(chunks)
+
+
+def render_audio_caption_html(
+    alias: str,
+    text: str | None,
+    formatted_body_html: str | None,
+    *,
+    forwarded: bool = False,
+    reply_hint: str | None = None,
+) -> str | None:
+    _ = text
+    if formatted_body_html is None:
+        return None
+    safe_alias = escape_html(sanitize_alias(alias))
+    chunks = _render_prefix_lines_html(forwarded=forwarded, reply_hint=reply_hint)
+    chunks.append(f"🔊 {safe_alias}")
+    chunks.append(formatted_body_html)
     return "\n".join(chunks)
 
 

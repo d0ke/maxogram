@@ -817,6 +817,39 @@ def test_normalize_telegram_video_sticker_is_relayable_video():
     assert media["payload"]["identity"] == "telegram:video:id:sticker-id"
 
 
+def test_normalize_telegram_animated_sticker_is_relayable_image_animation():
+    normalized = normalize_update(
+        Platform.TELEGRAM,
+        {
+            "update_id": 114,
+            "message": {
+                "message_id": 214,
+                "date": 1_700_000_000,
+                "chat": {"id": -100},
+                "from": {"id": 42, "first_name": "Alice", "is_bot": False},
+                "sticker": {
+                    "file_id": "animated-sticker-id",
+                    "file_unique_id": "animated-sticker-unique-id",
+                    "is_animated": True,
+                    "is_video": False,
+                    "file_size": 4096,
+                },
+            },
+        },
+    )
+
+    assert normalized is not None
+    media = _media_payload(normalized.payload)
+    assert media["supported"] is True
+    assert media["kind"] == "image"
+    assert media["text_hint"] == "[animated sticker]"
+    assert media["payload"]["filename"] == "sticker.tgs"
+    assert media["payload"]["mime_type"] == "application/x-tgsticker"
+    assert media["payload"]["sticker_variant"] == "animated_tgs"
+    assert media["payload"]["presentation"] == "animation"
+    assert media["payload"]["identity"] == "telegram:image:id:animated-sticker-unique-id"
+
+
 def test_normalize_max_image_attachment_keeps_direct_url():
     normalized = normalize_update(
         Platform.MAX,

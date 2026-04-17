@@ -148,6 +148,7 @@ async def test_reconciliation_worker_uses_backoff_for_transient_db_errors(
         database=cast(Any, None),
         stop_event=asyncio.Event(),
         idle_seconds=0.25,
+        root_dir=Path.cwd(),
     )
     delays: list[float] = []
     calls = {"count": 0}

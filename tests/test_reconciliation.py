@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
 from maxogram.domain import Platform, TaskStatus
+from maxogram.services.relay import (
+    animated_sticker_cache_dir,
+    prune_animated_sticker_cache,
+)
 from maxogram.workers.reconciliation import ReconciliationWorker
 
 
@@ -77,11 +83,12 @@ class FakeRepository:
         self.rescheduled.append(next_attempt_at)
 
 
-def make_worker() -> ReconciliationWorker:
+def make_worker(tmp_path: Path) -> ReconciliationWorker:
     return ReconciliationWorker(
         database=None,  # type: ignore[arg-type]
         stop_event=asyncio.Event(),
         idle_seconds=0,
+        root_dir=tmp_path,
     )
 
 
@@ -106,7 +113,9 @@ def make_mapping(*, dst_message_id: str) -> Any:
 
 
 @pytest.mark.asyncio
-async def test_requeue_pending_mutation_enqueues_outbox_when_mapping_exists():
+async def test_requeue_pending_mutation_enqueues_outbox_when_mapping_exists(
+    tmp_path: Path,
+):
     pending = make_pending(
         payload={
             "src": {"platform": "max", "chat_id": "100", "message_id": "mid-1"},
@@ -119,7 +128,7 @@ async def test_requeue_pending_mutation_enqueues_outbox_when_mapping_exists():
         mapping=make_mapping(dst_message_id="tg-msg-1"),
         event_id=uuid.uuid4(),
     )
-    worker = make_worker()
+    worker = make_worker(tmp_path)
 
     replayed = await worker._requeue_pending(repo)  # type: ignore[arg-type]
 
@@ -137,7 +146,9 @@ async def test_requeue_pending_mutation_enqueues_outbox_when_mapping_exists():
 
 
 @pytest.mark.asyncio
-async def test_requeue_pending_mutation_reschedules_when_mapping_is_missing():
+async def test_requeue_pending_mutation_reschedules_when_mapping_is_missing(
+    tmp_path: Path,
+):
     pending = make_pending(
         payload={
             "src": {"platform": "max", "chat_id": "100", "message_id": "mid-1"},
@@ -151,7 +162,7 @@ async def test_requeue_pending_mutation_reschedules_when_mapping_is_missing():
         mapping=None,
         event_id=uuid.uuid4(),
     )
-    worker = make_worker()
+    worker = make_worker(tmp_path)
 
     replayed = await worker._requeue_pending(repo)  # type: ignore[arg-type]
 
@@ -160,3 +171,102 @@ async def test_requeue_pending_mutation_reschedules_when_mapping_is_missing():
     assert repo.done == []
     assert len(repo.rescheduled) == 1
     assert pending.status == TaskStatus.RETRY_WAIT
+
+
+def test_prune_animated_sticker_cache_removes_only_stale_files(tmp_path: Path):
+    cache_dir = animated_sticker_cache_dir(tmp_path)
+    cache_dir.mkdir(parents=True)
+    stale_file = cache_dir / "stale.gif"
+    fresh_file = cache_dir / "fresh.gif"
+    stale_file.write_bytes(b"old")
+    fresh_file.write_bytes(b"new")
+
+    stale_timestamp = datetime.now(UTC) - timedelta(days=91)
+    fresh_timestamp = datetime.now(UTC) - timedelta(days=5)
+    stale_epoch = stale_timestamp.timestamp()
+    fresh_epoch = fresh_timestamp.timestamp()
+    stale_file.touch()
+    fresh_file.touch()
+    os.utime(stale_file, (stale_epoch, stale_epoch))
+    os.utime(fresh_file, (fresh_epoch, fresh_epoch))
+
+    pruned = prune_animated_sticker_cache(tmp_path, now=datetime.now(UTC))
+
+    assert pruned == 1
+    assert not stale_file.exists()
+    assert fresh_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_prunes_animated_sticker_cache_only_once_per_day(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[Path] = []
+
+    class FakeSession:
+        async def __aenter__(self) -> "FakeSession":
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            _ = exc_type, exc, tb
+            return None
+
+        class _Begin:
+            async def __aenter__(self) -> "FakeSession._Begin":
+                return self
+
+            async def __aexit__(
+                self,
+                exc_type: object,
+                exc: object,
+                tb: object,
+            ) -> None:
+                _ = exc_type, exc, tb
+                return None
+
+        def begin(self) -> "FakeSession._Begin":
+            return self._Begin()
+
+    class FakeDatabase:
+        def session(self) -> FakeSession:
+            return FakeSession()
+
+    class FakeRunOnceRepository:
+        def __init__(self, session: FakeSession) -> None:
+            _ = session
+
+        async def reset_expired_inflight(self) -> int:
+            return 0
+
+        async def claim_pending_mutations(self, limit: int) -> list[Any]:
+            _ = limit
+            return []
+
+        async def expire_pending_mutations(self) -> int:
+            return 0
+
+    def fake_prune(root_dir: Path, *, now: datetime | None = None) -> int:
+        _ = now
+        calls.append(root_dir)
+        return 0
+
+    worker = ReconciliationWorker(
+        database=cast(Any, FakeDatabase()),
+        stop_event=asyncio.Event(),
+        idle_seconds=0,
+        root_dir=tmp_path,
+    )
+    monkeypatch.setattr(
+        "maxogram.workers.reconciliation.Repository",
+        FakeRunOnceRepository,
+    )
+    monkeypatch.setattr(
+        "maxogram.workers.reconciliation.prune_animated_sticker_cache",
+        fake_prune,
+    )
+
+    await worker.run_once()
+    await worker.run_once()
+
+    assert calls == [tmp_path]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -23,6 +24,11 @@ from maxogram.domain import (
 )
 from maxogram.platforms.base import PlatformDeliveryError
 from maxogram.platforms.telegram import TelegramClient
+from maxogram.services.relay import (
+    animated_sticker_cache_dir,
+    cleanup_local_media,
+    materialize_media,
+)
 from maxogram.workers.delivery import DeliveryContext, DeliveryWorker, EditMode
 from maxogram.workers.reconciliation import ReconciliationWorker
 
@@ -163,6 +169,11 @@ class FakeClient:
             path=destination,
             filename=filename,
             mime_type=str(media.get("mime_type") or "application/octet-stream"),
+            sticker_variant=(
+                str(media["sticker_variant"])
+                if media.get("sticker_variant") is not None
+                else None
+            ),
             presentation=(
                 MediaPresentation(str(media["presentation"]))
                 if media.get("presentation") is not None
@@ -607,13 +618,16 @@ def media_payload(
     identity: str,
     presentation: str | None = None,
     source: dict[str, object] | None = None,
+    filename: str = "relay.bin",
+    mime_type: str = "application/octet-stream",
+    sticker_variant: str | None = None,
 ) -> dict[str, Any]:
     payload = {
         "source_platform": source_platform.value,
         "kind": kind,
         "placeholder": "[photo]" if kind == "image" else f"[{kind}]",
-        "filename": "relay.bin",
-        "mime_type": "application/octet-stream",
+        "filename": filename,
+        "mime_type": mime_type,
         "identity": identity,
         "source": source
         or (
@@ -624,6 +638,8 @@ def media_payload(
     }
     if presentation is not None:
         payload["presentation"] = presentation
+    if sticker_variant is not None:
+        payload["sticker_variant"] = sticker_variant
     return payload
 
 
@@ -996,6 +1012,166 @@ async def test_delivery_falls_back_to_text_when_media_is_not_materialized(
     assert max_client.send_message_calls == []
     assert len(max_client.send_text_calls) == 1
     assert max_client.send_text_calls[0]["text"] == "Alice: [photo]"
+
+
+@pytest.mark.asyncio
+async def test_materialize_telegram_animated_sticker_converts_and_caches_gif(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    telegram = FakeClient("telegram", download_kind=MediaKind.IMAGE)
+    media = media_payload(
+        source_platform=Platform.TELEGRAM,
+        kind="image",
+        identity="telegram:image:id:animated-sticker",
+        presentation="animation",
+        filename="sticker.tgs",
+        mime_type="application/x-tgsticker",
+        sticker_variant="animated_tgs",
+    )
+
+    async def fake_convert(source_path: Path, cache_path: Path) -> None:
+        assert source_path.suffix == ".tgs"
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(cache_path.write_bytes, b"GIF89a-test")
+
+    monkeypatch.setattr(
+        "maxogram.services.relay._convert_tgs_to_cached_gif",
+        fake_convert,
+    )
+
+    local_media = await materialize_media(
+        clients={Platform.TELEGRAM: cast(Any, telegram)},
+        media=media,
+        root_dir=tmp_path,
+    )
+
+    assert local_media is not None
+    assert len(telegram.download_calls) == 1
+    assert local_media.path.parent == animated_sticker_cache_dir(tmp_path)
+    assert local_media.path.exists()
+    assert local_media.filename == "sticker.gif"
+    assert local_media.mime_type == "image/gif"
+    assert local_media.sticker_variant == "animated_tgs"
+    assert local_media.presentation == MediaPresentation.ANIMATION
+    assert local_media.cleanup_after_use is False
+    cleanup_local_media(local_media)
+    assert local_media.path.exists()
+
+
+@pytest.mark.asyncio
+async def test_materialize_telegram_animated_sticker_uses_cache_without_download(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    telegram = FakeClient("telegram", download_kind=MediaKind.IMAGE)
+    media = media_payload(
+        source_platform=Platform.TELEGRAM,
+        kind="image",
+        identity="telegram:image:id:animated-sticker",
+        presentation="animation",
+        filename="sticker.tgs",
+        mime_type="application/x-tgsticker",
+        sticker_variant="animated_tgs",
+    )
+
+    async def fake_convert(source_path: Path, cache_path: Path) -> None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(cache_path.write_bytes, b"GIF89a-test")
+
+    monkeypatch.setattr(
+        "maxogram.services.relay._convert_tgs_to_cached_gif",
+        fake_convert,
+    )
+
+    first_media = await materialize_media(
+        clients={Platform.TELEGRAM: cast(Any, telegram)},
+        media=media,
+        root_dir=tmp_path,
+    )
+    assert first_media is not None
+    assert len(telegram.download_calls) == 1
+
+    stale_timestamp = datetime.now(UTC) - timedelta(days=10)
+    await asyncio.to_thread(first_media.path.touch)
+    await asyncio.to_thread(
+        os.utime,
+        first_media.path,
+        (stale_timestamp.timestamp(), stale_timestamp.timestamp()),
+    )
+
+    async def fail_convert(source_path: Path, cache_path: Path) -> None:
+        raise AssertionError("cache hit should skip conversion")
+
+    monkeypatch.setattr(
+        "maxogram.services.relay._convert_tgs_to_cached_gif",
+        fail_convert,
+    )
+    telegram.download_calls.clear()
+
+    second_media = await materialize_media(
+        clients={Platform.TELEGRAM: cast(Any, telegram)},
+        media=media,
+        root_dir=tmp_path,
+    )
+
+    assert second_media is not None
+    assert telegram.download_calls == []
+    assert second_media.path == first_media.path
+    assert second_media.path.stat().st_mtime > stale_timestamp.timestamp()
+
+
+@pytest.mark.asyncio
+async def test_delivery_falls_back_to_text_when_animated_sticker_conversion_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    telegram = FakeClient("telegram", download_kind=MediaKind.IMAGE)
+    max_client = FakeClient("max")
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+    )
+    context = make_context(
+        action="send",
+        bridge_id=uuid.uuid4(),
+        dst_platform=Platform.MAX,
+        task_payload={
+            "src": {"platform": "telegram", "chat_id": "-100", "message_id": "11"},
+            "dst": {"platform": "max", "chat_id": "200"},
+            "text": "Alice:",
+            "fallback_text": "Alice: [animated sticker]",
+            "has_media": True,
+            "media_kind": "image",
+            "media": media_payload(
+                source_platform=Platform.TELEGRAM,
+                kind="image",
+                identity="telegram:image:id:animated-sticker",
+                presentation="animation",
+                filename="sticker.tgs",
+                mime_type="application/x-tgsticker",
+                sticker_variant="animated_tgs",
+            ),
+        },
+    )
+
+    async def fail_convert(source_path: Path, cache_path: Path) -> None:
+        raise RuntimeError("conversion boom")
+
+    monkeypatch.setattr(
+        "maxogram.services.relay._convert_tgs_to_cached_gif",
+        fail_convert,
+    )
+
+    await worker._call_platform(context)
+
+    assert len(telegram.download_calls) == 1
+    assert max_client.send_message_calls == []
+    assert len(max_client.send_text_calls) == 1
+    assert max_client.send_text_calls[0]["text"] == "Alice: [animated sticker]"
 
 
 @pytest.mark.asyncio
@@ -1762,6 +1938,7 @@ async def test_delivery_heartbeat_prevents_duplicate_requeue_for_slow_send(
         database=database,  # type: ignore[arg-type]
         stop_event=asyncio.Event(),
         idle_seconds=0,
+        root_dir=tmp_path,
     )
     monkeypatch.setattr("maxogram.workers.delivery.Repository", FakeRepository)
     monkeypatch.setattr("maxogram.workers.reconciliation.Repository", FakeRepository)
@@ -1970,6 +2147,7 @@ async def test_max_link_send_then_edit_replays_once_without_duplicate_send(
         database=database,  # type: ignore[arg-type]
         stop_event=asyncio.Event(),
         idle_seconds=0,
+        root_dir=tmp_path,
     )
 
     def fail_serialize(message: object) -> object:

@@ -165,6 +165,7 @@ The reconciliation worker:
 - resets expired in-flight outbox rows
 - replays `pending_mutations` after mappings appear
 - expires unrecoverable pending mutations into `dead_letters`
+- prunes converted animated-sticker GIF cache entries not used for more than 90 days
 
 ## Database Architecture
 
@@ -531,7 +532,7 @@ Columns:
 
 Notes:
 
-- the live runtime currently uses transient files under `temp/media_cache` instead of persisting media metadata here
+- the live runtime currently uses transient files under `temp/media_cache` plus a container-local animated sticker GIF cache under `temp/animated_sticker_cache` instead of persisting media metadata here
 
 #### `link_codes`
 
@@ -615,6 +616,7 @@ Telegram-origin media currently supports:
 - documents
 - audio
 - voice
+- animated stickers as `.tgs -> GIF -> MAX image`
 - static stickers as images
 - video stickers as videos
 

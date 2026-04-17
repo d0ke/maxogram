@@ -143,7 +143,12 @@ class NormalizerWorker:
             return None
 
         dst_platform = dst_chat.platform
-        payload = await self._build_payload(repo, normalized, bridge.bridge_id)
+        payload = await self._build_payload(
+            repo,
+            normalized,
+            bridge.bridge_id,
+            dst_platform=dst_platform,
+        )
         payload["dst"] = {"platform": dst_platform.value, "chat_id": dst_chat.chat_id}
         event_id = await repo.insert_canonical_event(
             bridge_id=bridge.bridge_id,
@@ -206,7 +211,15 @@ class NormalizerWorker:
         repo: Repository,
         normalized: NormalizedUpdate,
         bridge_id: uuid.UUID,
+        *,
+        dst_platform: Platform | None = None,
     ) -> dict[str, object]:
+        if dst_platform is None:
+            dst_platform = (
+                Platform.MAX
+                if normalized.platform == Platform.TELEGRAM
+                else Platform.TELEGRAM
+            )
         alias = await repo.get_alias(
             bridge_id,
             normalized.platform,
@@ -226,26 +239,32 @@ class NormalizerWorker:
             else None
         )
         placeholder = _media_text_hint(normalized.payload)
+        post_send_text_plain: str | None = None
+        post_send_text_html: str | None = None
         if media is not None and media_kind in {"audio", "voice"}:
-            rendered_plain = render_audio_caption(
+            audio_text_plain = render_audio_caption(
                 alias,
                 normalized.text,
                 forwarded=normalized.forwarded,
                 reply_hint=reply_hint,
             )
-            rendered_html = render_audio_caption_html(
+            audio_text_html = render_audio_caption_html(
                 alias,
                 normalized.text,
                 normalized.formatted_html,
                 forwarded=normalized.forwarded,
                 reply_hint=reply_hint,
             )
-            fallback_text = render_audio_caption(
-                alias,
-                normalized.text,
-                forwarded=normalized.forwarded,
-                reply_hint=reply_hint,
-            )
+            if normalized.platform == Platform.TELEGRAM and dst_platform == Platform.MAX:
+                rendered_plain = ""
+                rendered_html = None
+                fallback_text = audio_text_plain
+                post_send_text_plain = audio_text_plain
+                post_send_text_html = audio_text_html
+            else:
+                rendered_plain = audio_text_plain
+                rendered_html = audio_text_html
+                fallback_text = audio_text_plain
         elif media is not None:
             rendered_plain = render_media_caption(
                 alias,
@@ -290,7 +309,7 @@ class NormalizerWorker:
                 reply_hint=reply_hint,
                 media_hint=placeholder,
             )
-        return {
+        payload = {
             "src": {
                 "platform": identity.platform.value,
                 "chat_id": normalized.chat_id,
@@ -308,6 +327,11 @@ class NormalizerWorker:
             "media": media,
             "version": normalized.event_version,
         }
+        if post_send_text_plain is not None:
+            payload["post_send_text_plain"] = post_send_text_plain
+        if post_send_text_html is not None:
+            payload["post_send_text_html"] = post_send_text_html
+        return payload
 
     async def _resolve_reply_target(
         self,

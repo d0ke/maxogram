@@ -370,9 +370,11 @@ async def test_build_payload_uses_audio_label_for_telegram_audio_caption():
         bridge_id,
     )
 
-    assert payload["text_plain"] == "🔊 Alice\ncaption"
-    assert payload["text_html"] == "🔊 Alice\n<b>caption</b>"
+    assert payload["text_plain"] == ""
+    assert payload["text_html"] is None
     assert payload["fallback_text"] == "🔊 Alice\ncaption"
+    assert payload["post_send_text_plain"] == "🔊 Alice\ncaption"
+    assert payload["post_send_text_html"] == "🔊 Alice\n<b>caption</b>"
     assert payload["media_kind"] == "audio"
 
 
@@ -394,9 +396,11 @@ async def test_build_payload_uses_audio_label_for_telegram_voice_without_text():
         bridge_id,
     )
 
-    assert payload["text_plain"] == "🔊 Alice"
+    assert payload["text_plain"] == ""
     assert payload["text_html"] is None
     assert payload["fallback_text"] == "🔊 Alice"
+    assert payload["post_send_text_plain"] == "🔊 Alice"
+    assert "post_send_text_html" not in payload
     assert payload["media_kind"] == "voice"
 
 
@@ -423,6 +427,7 @@ async def test_build_payload_uses_audio_label_for_max_audio_caption():
 
     assert payload["text_plain"] == "🔊 Alice\nlisten"
     assert payload["fallback_text"] == "🔊 Alice\nlisten"
+    assert "post_send_text_plain" not in payload
     assert payload["media_kind"] == "audio"
 
 

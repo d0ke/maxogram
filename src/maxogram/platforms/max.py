@@ -127,6 +127,8 @@ class MaxClient:
             if media is not None
             else None
         )
+        if attachments is not None and rendered_text == "" and text_format is None:
+            rendered_text = None
         try:
             result = await self.bot.send_message(
                 chat_id=int(chat_id),
@@ -135,7 +137,6 @@ class MaxClient:
                 link=link,
                 format=text_format,
                 parse_mode=None,
-                sleep_after_input_media=False,
             )
         except MaxApiError as exc:
             raise _max_error(exc) from exc
@@ -184,7 +185,6 @@ class MaxClient:
                     attachments=attachments,
                     format=text_format,
                     parse_mode=None,
-                    sleep_after_input_media=False,
                 )
         except MaxApiError as exc:
             raise _max_error(exc) from exc

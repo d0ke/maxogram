@@ -542,6 +542,9 @@ def make_context(
         src_platform=Platform(str(src["platform"])),
         src_chat_id=str(src["chat_id"]),
         src_message_id=str(src["message_id"]),
+        src_event_id=uuid.uuid4(),
+        dedup_key=f"{bridge_id}:{src['platform']}:{src['chat_id']}:{src['message_id']}:{action}",
+        partition_key=f"{bridge_id}:{src['platform']}_to_{dst_platform.value}",
         edit_mode=edit_mode,
     )
 
@@ -554,13 +557,16 @@ def make_task(
     task_payload: dict[str, Any],
     outbox_id: uuid.UUID | None = None,
 ) -> Any:
+    src = cast(dict[str, Any], task_payload["src"])
     return SimpleNamespace(
         outbox_id=outbox_id or uuid.uuid4(),
         bridge_id=bridge_id,
+        dedup_key=f"{bridge_id}:{src['platform']}:{src['chat_id']}:{src['message_id']}:{action}",
+        src_event_id=uuid.uuid4(),
         action=action,
         task=task_payload,
         dst_platform=dst_platform,
-        partition_key=f"{bridge_id}:{dst_platform.value}",
+        partition_key=f"{bridge_id}:{src['platform']}_to_{dst_platform.value}",
         seq=1,
         status=TaskStatus.READY,
         attempt_count=0,
@@ -990,6 +996,205 @@ async def test_delivery_falls_back_to_text_when_media_is_not_materialized(
     assert max_client.send_message_calls == []
     assert len(max_client.send_text_calls) == 1
     assert max_client.send_text_calls[0]["text"] == "Alice: [photo]"
+
+
+@pytest.mark.asyncio
+async def test_delivery_enqueues_follow_up_text_after_successful_telegram_audio_send(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    bridge_id = uuid.uuid4()
+    task = make_task(
+        action="send",
+        bridge_id=bridge_id,
+        dst_platform=Platform.MAX,
+        task_payload={
+            "src": {"platform": "telegram", "chat_id": "-100", "message_id": "audio-1"},
+            "dst": {"platform": "max", "chat_id": "200"},
+            "text_plain": "",
+            "text_html": None,
+            "fallback_text": "🔊 Alice\ncaption",
+            "post_send_text_plain": "🔊 Alice\ncaption",
+            "post_send_text_html": "🔊 Alice\n<b>caption</b>",
+            "has_media": True,
+            "media_kind": "audio",
+            "media": media_payload(
+                source_platform=Platform.TELEGRAM,
+                kind="audio",
+                identity="telegram:audio:id:file-id",
+                source={"file_id": "file-id"},
+            ),
+        },
+    )
+    state = DeliveryState(tasks={task.outbox_id: task})
+    database = FakeDatabase(state)
+    telegram = FakeClient("telegram", download_kind=MediaKind.AUDIO)
+    max_client = FakeClient("max")
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+        database=database,
+    )
+    monkeypatch.setattr("maxogram.workers.delivery.Repository", FakeRepository)
+
+    processed_primary = await worker.run_once()
+
+    assert processed_primary == 1
+    assert len(max_client.send_message_calls) == 1
+    assert max_client.send_message_calls[0]["text"] == ""
+    assert len(state.mappings) == 1
+    assert state.mappings[0]["dst_message_id"] == "max-media-1"
+    assert len(state.tasks) == 2
+
+    follow_up_tasks = [
+        queued_task
+        for queued_task in state.tasks.values()
+        if queued_task.outbox_id != task.outbox_id
+    ]
+    assert len(follow_up_tasks) == 1
+    follow_up_task = follow_up_tasks[0]
+    assert follow_up_task.task["text_plain"] == "🔊 Alice\ncaption"
+    assert follow_up_task.task["text_html"] == "🔊 Alice\n<b>caption</b>"
+    assert follow_up_task.task["reply_to_message_id"] == "max-media-1"
+    assert follow_up_task.task["creates_mapping"] is False
+    assert follow_up_task.status == TaskStatus.READY
+
+    processed_follow_up = await worker.run_once()
+
+    assert processed_follow_up == 1
+    assert len(max_client.send_text_calls) == 1
+    assert max_client.send_text_calls[0]["text"] == "🔊 Alice\ncaption"
+    assert max_client.send_text_calls[0]["reply_to_message_id"] == "max-media-1"
+    assert len(state.mappings) == 1
+    assert [attempt["outcome"] for attempt in state.attempts] == [
+        DeliveryOutcome.SUCCESS,
+        DeliveryOutcome.SUCCESS,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delivery_does_not_enqueue_follow_up_text_when_audio_falls_back_to_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    bridge_id = uuid.uuid4()
+    task = make_task(
+        action="send",
+        bridge_id=bridge_id,
+        dst_platform=Platform.MAX,
+        task_payload={
+            "src": {"platform": "telegram", "chat_id": "-100", "message_id": "audio-2"},
+            "dst": {"platform": "max", "chat_id": "200"},
+            "text_plain": "",
+            "text_html": None,
+            "fallback_text": "🔊 Alice",
+            "post_send_text_plain": "🔊 Alice",
+            "has_media": True,
+            "media_kind": "voice",
+            "media": media_payload(
+                source_platform=Platform.TELEGRAM,
+                kind="voice",
+                identity="telegram:voice:id:file-id",
+                source={"file_id": "file-id"},
+            ),
+        },
+    )
+    state = DeliveryState(tasks={task.outbox_id: task})
+    database = FakeDatabase(state)
+    telegram = FakeClient("telegram", download_kind=None)
+    max_client = FakeClient("max")
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+        database=database,
+    )
+    monkeypatch.setattr("maxogram.workers.delivery.Repository", FakeRepository)
+
+    processed = await worker.run_once()
+
+    assert processed == 1
+    assert max_client.send_message_calls == []
+    assert len(max_client.send_text_calls) == 1
+    assert max_client.send_text_calls[0]["text"] == "🔊 Alice"
+    assert len(state.tasks) == 1
+    assert len(state.mappings) == 1
+
+
+@pytest.mark.asyncio
+async def test_delivery_follow_up_text_retries_without_creating_extra_mapping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    bridge_id = uuid.uuid4()
+    task = make_task(
+        action="send",
+        bridge_id=bridge_id,
+        dst_platform=Platform.MAX,
+        task_payload={
+            "src": {"platform": "telegram", "chat_id": "-100", "message_id": "audio-3"},
+            "dst": {"platform": "max", "chat_id": "200"},
+            "text_plain": "",
+            "text_html": None,
+            "fallback_text": "🔊 Alice\ncaption",
+            "post_send_text_plain": "🔊 Alice\ncaption",
+            "has_media": True,
+            "media_kind": "audio",
+            "media": media_payload(
+                source_platform=Platform.TELEGRAM,
+                kind="audio",
+                identity="telegram:audio:id:file-id",
+                source={"file_id": "file-id"},
+            ),
+        },
+    )
+    state = DeliveryState(tasks={task.outbox_id: task})
+    database = FakeDatabase(state)
+    telegram = FakeClient("telegram", download_kind=MediaKind.AUDIO)
+
+    def fail_follow_up() -> None:
+        raise PlatformDeliveryError(
+            "temporary follow-up failure",
+            retryable=True,
+            code="temporary_follow_up_failure",
+        )
+
+    max_client = FakeClient("max", on_send_text=fail_follow_up)
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+        database=database,
+    )
+    monkeypatch.setattr("maxogram.workers.delivery.Repository", FakeRepository)
+
+    processed_primary = await worker.run_once()
+
+    assert processed_primary == 1
+    assert len(state.mappings) == 1
+
+    follow_up_task = next(
+        queued_task
+        for queued_task in state.tasks.values()
+        if queued_task.outbox_id != task.outbox_id
+    )
+
+    processed_follow_up = await worker.run_once()
+
+    assert processed_follow_up == 1
+    assert follow_up_task.status == TaskStatus.RETRY_WAIT
+    assert len(state.mappings) == 1
+    assert [attempt["outcome"] for attempt in state.attempts] == [
+        DeliveryOutcome.SUCCESS,
+        DeliveryOutcome.RETRY,
+    ]
 
 
 @pytest.mark.asyncio

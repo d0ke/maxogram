@@ -45,12 +45,16 @@ class DeliveryContext:
     src_platform: Platform | None
     src_chat_id: str | None
     src_message_id: str | None
+    src_event_id: uuid.UUID | None = None
+    dedup_key: str | None = None
+    partition_key: str | None = None
     edit_mode: EditMode = EditMode.TEXT_ONLY
 
 
 @dataclass(frozen=True, slots=True)
 class DeliveryResult:
     dst_message_id: str | None = None
+    sent_with_media: bool = False
 
 
 class DeliveryWorker:
@@ -189,6 +193,9 @@ class DeliveryWorker:
                     src_platform=src_platform,
                     src_chat_id=_optional_str(src.get("chat_id")),
                     src_message_id=_optional_str(src.get("message_id")),
+                    src_event_id=task.src_event_id,
+                    dedup_key=task.dedup_key,
+                    partition_key=task.partition_key,
                     edit_mode=edit_mode,
                 )
 
@@ -197,8 +204,7 @@ class DeliveryWorker:
         client = self.clients[context.dst_platform]
 
         if context.action == OutboxAction.SEND:
-            result = await self._send_message(client, payload, context.dst_chat_id)
-            return DeliveryResult(dst_message_id=result.message_id)
+            return await self._send_message(client, payload, context.dst_chat_id)
         if context.action == OutboxAction.EDIT:
             replacement_media = None
             try:
@@ -249,7 +255,7 @@ class DeliveryWorker:
         client: PlatformClient,
         payload: dict[str, Any],
         chat_id: str,
-    ) -> Any:
+    ) -> DeliveryResult:
         media = _optional_dict(payload.get("media"))
         local_media = None
         try:
@@ -260,7 +266,7 @@ class DeliveryWorker:
                     root_dir=self.root_dir,
                 )
             if media is None:
-                return await client.send_text(
+                result = await client.send_text(
                     chat_id,
                     _payload_text_plain(payload),
                     text_html=_payload_text_html(payload),
@@ -268,20 +274,26 @@ class DeliveryWorker:
                         payload.get("reply_to_message_id")
                     ),
                 )
+                return DeliveryResult(dst_message_id=result.message_id)
             if local_media is None:
-                return await client.send_text(
+                result = await client.send_text(
                     chat_id,
                     _payload_fallback_text(payload),
                     reply_to_message_id=_optional_str(
                         payload.get("reply_to_message_id")
                     ),
                 )
-            return await client.send_message(
+                return DeliveryResult(dst_message_id=result.message_id)
+            result = await client.send_message(
                 chat_id,
                 _payload_text_plain(payload),
                 text_html=_payload_text_html(payload),
                 reply_to_message_id=_optional_str(payload.get("reply_to_message_id")),
                 media=local_media,
+            )
+            return DeliveryResult(
+                dst_message_id=result.message_id,
+                sent_with_media=True,
             )
         finally:
             cleanup_local_media(local_media)
@@ -414,6 +426,12 @@ class DeliveryWorker:
         context: DeliveryContext,
         result: DeliveryResult,
     ) -> None:
+        src_platform, src_chat_id, src_message_id = _mapping_source_fields(context)
+        post_send_payload = _build_post_send_task_payload(
+            context,
+            result,
+            reply_to_message_id=result.dst_message_id,
+        )
         async with self.database.session() as session:
             repo = Repository(session)
             async with session.begin():
@@ -424,10 +442,32 @@ class DeliveryWorker:
                     dst_platform=context.dst_platform,
                     dst_chat_id=context.dst_chat_id,
                     dst_message_id=result.dst_message_id,
-                    src_platform=context.src_platform,
-                    src_chat_id=context.src_chat_id,
-                    src_message_id=context.src_message_id,
+                    src_platform=src_platform,
+                    src_chat_id=src_chat_id,
+                    src_message_id=src_message_id,
                 )
+                if finalized and post_send_payload is not None:
+                    if context.src_event_id is None:
+                        raise PlatformDeliveryError(
+                            "Auxiliary post-send task requires src_event_id",
+                            retryable=True,
+                            code="missing_src_event_id",
+                        )
+                    if context.dedup_key is None or context.partition_key is None:
+                        raise PlatformDeliveryError(
+                            "Auxiliary post-send task requires queue metadata",
+                            retryable=True,
+                            code="missing_queue_metadata",
+                        )
+                    await repo.enqueue_outbox(
+                        bridge_id=context.bridge_id,
+                        dedup_key=f"{context.dedup_key}:post_send_text",
+                        src_event_id=context.src_event_id,
+                        dst_platform=context.dst_platform,
+                        action=OutboxAction.SEND,
+                        partition_key=context.partition_key,
+                        task=post_send_payload,
+                    )
         if not finalized:
             logger.warning(
                 "Skipped stale success finalization outbox_id=%s attempt=%s",
@@ -561,6 +601,73 @@ def _payload_fallback_text(payload: dict[str, Any]) -> str:
         return str(value)
     legacy = payload.get("text")
     return str(legacy) if legacy is not None else ""
+
+
+def _payload_post_send_text_plain(payload: dict[str, Any]) -> str | None:
+    value = payload.get("post_send_text_plain")
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _payload_post_send_text_html(payload: dict[str, Any]) -> str | None:
+    value = payload.get("post_send_text_html")
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _payload_creates_mapping(payload: dict[str, Any]) -> bool:
+    value = payload.get("creates_mapping")
+    if isinstance(value, bool):
+        return value
+    return True
+
+
+def _mapping_source_fields(
+    context: DeliveryContext,
+) -> tuple[Platform | None, str | None, str | None]:
+    if _payload_creates_mapping(context.payload):
+        return context.src_platform, context.src_chat_id, context.src_message_id
+    return None, None, None
+
+
+def _build_post_send_task_payload(
+    context: DeliveryContext,
+    result: DeliveryResult,
+    *,
+    reply_to_message_id: str | None,
+) -> dict[str, Any] | None:
+    if (
+        context.action != OutboxAction.SEND
+        or context.src_platform != Platform.TELEGRAM
+        or context.dst_platform != Platform.MAX
+        or not result.sent_with_media
+        or reply_to_message_id is None
+    ):
+        return None
+    post_send_text_plain = _payload_post_send_text_plain(context.payload)
+    if post_send_text_plain is None:
+        return None
+    src = _optional_dict(context.payload.get("src"))
+    dst = _optional_dict(context.payload.get("dst"))
+    if src is None or dst is None:
+        return None
+    return {
+        "src": src,
+        "dst": dst,
+        "text": post_send_text_plain,
+        "text_plain": post_send_text_plain,
+        "text_html": _payload_post_send_text_html(context.payload),
+        "fallback_text": post_send_text_plain,
+        "reply_to_message_id": reply_to_message_id,
+        "raw": context.payload.get("raw") or {},
+        "has_media": False,
+        "media_kind": None,
+        "media": None,
+        "version": context.payload.get("version"),
+        "creates_mapping": False,
+    }
 
 
 def _payload_raw_message(payload: dict[str, Any] | None) -> dict[str, Any] | None:

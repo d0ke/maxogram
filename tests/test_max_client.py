@@ -185,9 +185,34 @@ async def test_send_message_with_media_keeps_text_and_attachment_in_one_request(
     assert len(client.bot.send_message_calls) == 1  # type: ignore[attr-defined]
     send_call = client.bot.send_message_calls[0]  # type: ignore[attr-defined]
     assert send_call["text"] == "🔊 Alice"
+    assert "sleep_after_input_media" not in send_call
     assert len(send_call["attachments"]) == 1
     attachment = send_call["attachments"][0]
     assert attachment.__class__.__name__ == "InputMedia"
+
+
+@pytest.mark.asyncio
+async def test_send_message_with_media_uses_attachment_only_when_text_is_empty(
+    tmp_path: Path,
+) -> None:
+    client = make_client()
+    client.bot = FakeEditBot()  # type: ignore[attr-defined]
+    client.rate_limiter = cast(Any, NoopRateLimiter())  # type: ignore[attr-defined]
+    file_path = tmp_path / "voice.ogg"
+    file_path.write_bytes(b"voice")
+    media = LocalMediaFile(
+        kind=MediaKind.VOICE,
+        path=file_path,
+        filename="voice.ogg",
+        mime_type="audio/ogg",
+    )
+
+    await client.send_message("200", "", media=media)
+
+    assert len(client.bot.send_message_calls) == 1  # type: ignore[attr-defined]
+    send_call = client.bot.send_message_calls[0]  # type: ignore[attr-defined]
+    assert send_call["text"] is None
+    assert "sleep_after_input_media" not in send_call
 
 
 @pytest.mark.asyncio
@@ -239,6 +264,7 @@ async def test_edit_message_replaces_media_via_max_sdk_edit(tmp_path: Path) -> N
     edit_call = client.bot.edit_message_calls[0]  # type: ignore[attr-defined]
     assert edit_call["message_id"] == "mid-1"
     assert edit_call["text"] == "updated"
+    assert "sleep_after_input_media" not in edit_call
     assert len(edit_call["attachments"]) == 1
 
 
@@ -271,3 +297,4 @@ async def test_edit_message_replaces_media_with_html_format_when_available(
     edit_call = client.bot.edit_message_calls[0]  # type: ignore[attr-defined]
     assert edit_call["text"] == "<u>updated</u>"
     assert edit_call["format"] == TextFormat.HTML
+    assert "sleep_after_input_media" not in edit_call

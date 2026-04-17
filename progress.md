@@ -25,6 +25,11 @@
 - Restored `Telegram -> MAX` relay for Telegram `video_note` messages by classifying them as supported inbound video media instead of letting them degrade to `"[unsupported message]"`.
 - Added regression coverage for Telegram `video_note` normalization and delivery so round-video messages now download from Telegram and upload to MAX through the existing video pipeline.
 
+## 2026-04-17
+
+- Changed `Telegram -> MAX` audio and voice follow-up text delivery to send as a normal standalone next message instead of a reply to the mirrored MAX audio, while preserving the existing outbox ordering and retry behavior.
+- Updated delivery regression coverage so the auxiliary follow-up task no longer carries `reply_to_message_id`, still appears immediately after the audio in queue order, and still avoids creating an extra `message_mapping`.
+
 ## 2026-04-10
 
 - Built the initial bridge application skeleton: repository-root entrypoint, CLI commands, local configuration loading, async app lifecycle, SQLAlchemy models, Alembic setup, repositories, worker loops, platform adapters, and baseline tests.

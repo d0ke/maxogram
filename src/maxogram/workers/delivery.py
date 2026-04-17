@@ -430,7 +430,6 @@ class DeliveryWorker:
         post_send_payload = _build_post_send_task_payload(
             context,
             result,
-            reply_to_message_id=result.dst_message_id,
         )
         async with self.database.session() as session:
             repo = Repository(session)
@@ -635,15 +634,12 @@ def _mapping_source_fields(
 def _build_post_send_task_payload(
     context: DeliveryContext,
     result: DeliveryResult,
-    *,
-    reply_to_message_id: str | None,
 ) -> dict[str, Any] | None:
     if (
         context.action != OutboxAction.SEND
         or context.src_platform != Platform.TELEGRAM
         or context.dst_platform != Platform.MAX
         or not result.sent_with_media
-        or reply_to_message_id is None
     ):
         return None
     post_send_text_plain = _payload_post_send_text_plain(context.payload)
@@ -660,7 +656,6 @@ def _build_post_send_task_payload(
         "text_plain": post_send_text_plain,
         "text_html": _payload_post_send_text_html(context.payload),
         "fallback_text": post_send_text_plain,
-        "reply_to_message_id": reply_to_message_id,
         "raw": context.payload.get("raw") or {},
         "has_media": False,
         "media_kind": None,

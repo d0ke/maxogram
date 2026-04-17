@@ -1058,7 +1058,7 @@ async def test_delivery_enqueues_follow_up_text_after_successful_telegram_audio_
     follow_up_task = follow_up_tasks[0]
     assert follow_up_task.task["text_plain"] == "🔊 Alice\ncaption"
     assert follow_up_task.task["text_html"] == "🔊 Alice\n<b>caption</b>"
-    assert follow_up_task.task["reply_to_message_id"] == "max-media-1"
+    assert "reply_to_message_id" not in follow_up_task.task
     assert follow_up_task.task["creates_mapping"] is False
     assert follow_up_task.status == TaskStatus.READY
 
@@ -1067,7 +1067,7 @@ async def test_delivery_enqueues_follow_up_text_after_successful_telegram_audio_
     assert processed_follow_up == 1
     assert len(max_client.send_text_calls) == 1
     assert max_client.send_text_calls[0]["text"] == "🔊 Alice\ncaption"
-    assert max_client.send_text_calls[0]["reply_to_message_id"] == "max-media-1"
+    assert max_client.send_text_calls[0]["reply_to_message_id"] is None
     assert len(state.mappings) == 1
     assert [attempt["outcome"] for attempt in state.attempts] == [
         DeliveryOutcome.SUCCESS,

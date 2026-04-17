@@ -22,7 +22,22 @@ COPY src ./src
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
-    && pip install .
+    && pip install . \
+    && python - <<'PY'
+from importlib.util import find_spec
+from pathlib import Path
+
+spec = find_spec("pyrlottie")
+if spec is None or spec.origin is None:
+    raise RuntimeError("pyrlottie is not installed")
+
+package_dir = Path(spec.origin).resolve().parent
+binary_dir = package_dir / "linux_x86_64"
+for binary_name in ("lottie2gif", "gif2webp"):
+    binary_path = binary_dir / binary_name
+    if binary_path.exists():
+        binary_path.chmod(0o755)
+PY
 
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["python", "-m", "maxogram", "run"]

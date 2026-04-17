@@ -38,6 +38,48 @@ jobs:
             type=ref,event=tag
             type=sha
 
+      - name: Build smoke image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: maxogram-smoke:${{ github.sha }}
+          cache-from: type=gha
+
+      - name: Smoke check pyrlottie binaries
+        run: |
+          docker run --rm -i --entrypoint python maxogram-smoke:${{ github.sha }} - <<'PY'
+          from importlib.util import find_spec
+          from pathlib import Path
+          import os
+          import subprocess
+
+          spec = find_spec("pyrlottie")
+          assert spec is not None and spec.origin is not None, "pyrlottie is not installed"
+
+          binary_dir = Path(spec.origin).resolve().parent / "linux_x86_64"
+          lottie2gif = binary_dir / "lottie2gif"
+          gif2webp = binary_dir / "gif2webp"
+
+          missing = [str(path) for path in (lottie2gif, gif2webp) if not path.exists()]
+          assert not missing, f"missing pyrlottie binaries: {missing}"
+
+          non_exec = [str(path) for path in (lottie2gif, gif2webp) if not os.access(path, os.X_OK)]
+          assert not non_exec, f"pyrlottie binaries are not executable: {non_exec}"
+
+          result = subprocess.run(
+              ["/bin/sh", "-lc", str(lottie2gif)],
+              capture_output=True,
+              text=True,
+              timeout=10,
+          )
+          combined = (result.stdout or "") + (result.stderr or "")
+          assert result.returncode != 126, combined
+          assert "permission denied" not in combined.lower(), combined
+          print(f"Smoke check passed for {lottie2gif} and {gif2webp}")
+          PY
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:

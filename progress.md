@@ -11,6 +11,9 @@
 
 ## 2026-04-18
 
+- Fixed the Docker production artifact for Telegram animated sticker conversion by forcing executable permissions on bundled `pyrlottie` Linux helper binaries after the final `pip install .` layer.
+- Added a Docker publish smoke check in GitHub Actions that builds the image locally, verifies `pyrlottie/linux_x86_64/lottie2gif` and `gif2webp` are executable, and fails before push if the container still reports `permission denied`.
+- Confirmed the animated sticker regression root cause was Docker runtime file permissions inside the published image rather than bridge normalization, database state, or delivery fallback logic.
 - Moved the supported runtime baseline from Python `3.13` to Python `3.12` by changing the production `Dockerfile` base image and tightening package metadata in `pyproject.toml` to `>=3.12,<3.13`.
 - Updated Ruff and mypy configuration targets to Python `3.12` so local static analysis matches the supported runtime.
 - Updated `README.md` to state that both production and local development now target Python `3.12`, and that existing Python `3.13` virtual environments are unsupported and should be recreated.

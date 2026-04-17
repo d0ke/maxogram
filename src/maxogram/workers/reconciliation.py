@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from maxogram.db.repositories import Repository
@@ -14,6 +15,10 @@ from maxogram.runtime_resilience import (
     wait_or_stop,
 )
 from maxogram.services.dedup import outbox_dedup_key, partition_key
+from maxogram.services.relay import (
+    ANIMATED_STICKER_CACHE_SWEEP_INTERVAL,
+    prune_animated_sticker_cache,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,15 +32,18 @@ class ReconciliationWorker:
         database: Database,
         stop_event: asyncio.Event,
         idle_seconds: float,
+        root_dir: Path,
         pending_batch_size: int = 50,
         pending_retry_seconds: int = 5,
     ) -> None:
         self.database = database
         self.stop_event = stop_event
         self.idle_seconds = idle_seconds
+        self.root_dir = root_dir
         self.pending_batch_size = pending_batch_size
         self.pending_retry_seconds = pending_retry_seconds
         self._retry_backoff = RuntimeBackoffState()
+        self._last_cache_prune_at: datetime | None = None
 
     async def run(self) -> None:
         while not self.stop_event.is_set():
@@ -61,12 +69,14 @@ class ReconciliationWorker:
                 reset = await repo.reset_expired_inflight()
                 replayed = await self._requeue_pending(repo)
                 expired = await repo.expire_pending_mutations()
-        if reset or replayed or expired:
+        pruned = await self._prune_animated_sticker_cache_if_due()
+        if reset or replayed or expired or pruned:
             logger.info(
-                "Reconciled reset=%s replayed=%s expired=%s",
+                "Reconciled reset=%s replayed=%s expired=%s pruned=%s",
                 reset,
                 replayed,
                 expired,
+                pruned,
             )
         return reset, replayed, expired
 
@@ -178,3 +188,20 @@ class ReconciliationWorker:
             datetime.now(UTC) + timedelta(seconds=self.pending_retry_seconds),
             pending.expires_at,
         )
+
+    async def _prune_animated_sticker_cache_if_due(self) -> int:
+        now = datetime.now(UTC)
+        if self._last_cache_prune_at is not None and (
+            now - self._last_cache_prune_at
+        ) < ANIMATED_STICKER_CACHE_SWEEP_INTERVAL:
+            return 0
+        self._last_cache_prune_at = now
+        try:
+            return await asyncio.to_thread(
+                prune_animated_sticker_cache,
+                self.root_dir,
+                now=now,
+            )
+        except Exception:
+            logger.exception("Animated sticker cache pruning failed")
+            return 0

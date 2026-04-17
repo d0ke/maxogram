@@ -116,6 +116,7 @@ class LocalMediaFile:
     mime_type: str | None = None
     sticker_variant: str | None = None
     presentation: MediaPresentation | None = None
+    cleanup_after_use: bool = True
 
 
 @dataclass(frozen=True, slots=True)

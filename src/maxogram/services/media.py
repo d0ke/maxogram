@@ -104,7 +104,15 @@ def _telegram_animation_plan(animation: dict[str, Any]) -> MediaPlan:
 
 def _telegram_sticker_plan(sticker: dict[str, Any]) -> MediaPlan:
     if sticker.get("is_animated"):
-        return MediaPlan(False, text_hint="[animated sticker preview]")
+        return _telegram_file_plan(
+            sticker,
+            kind=MediaKind.IMAGE,
+            text_hint="[animated sticker]",
+            filename="sticker.tgs",
+            mime_type="application/x-tgsticker",
+            sticker_variant="animated_tgs",
+            presentation=MediaPresentation.ANIMATION,
+        )
 
     if sticker.get("is_video"):
         return _telegram_file_plan(

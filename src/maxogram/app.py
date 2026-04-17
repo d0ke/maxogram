@@ -98,6 +98,7 @@ class MaxogramApp:
                     database=self.database,
                     stop_event=self.stop_event,
                     idle_seconds=max(self.settings.worker_idle_seconds, 5.0),
+                    root_dir=self.settings.root_dir,
                 ),
             ]
 

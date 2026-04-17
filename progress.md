@@ -2,12 +2,19 @@
 
 ## Current State
 
-- Runtime: the project runs as a single asyncio process with five worker loops: Telegram poller, MAX poller, normalizer, delivery, and reconciliation. Production configuration is env-first with `tokens.py` kept as a fallback for local development, the public deployment artifact is a Docker image, and PostgreSQL is the only durable store for state and queueing.
-- Supported behavior: bidirectional text relay with alias prefixes, native replies where mappings exist, real media relay for common attachment types, GIF and animation handling, supported Telegram/MAX formatting preservation, repeated-forward unwrap for mirrored bot messages so alias wrappers and forwarded media survive re-forwarding cleanly, bridge commands, and mirrored edit/delete sync with pending-mutation replay.
+- Runtime: the project runs as a single asyncio process with five worker loops: Telegram poller, MAX poller, normalizer, delivery, and reconciliation. Production configuration is env-first with `tokens.py` kept as a fallback for local development, the public deployment artifact is a Docker image based on Python `3.12`, local development is expected to use Python `3.12`, and PostgreSQL is the only durable store for state and queueing.
+- Supported behavior: bidirectional text relay with alias prefixes, native replies where mappings exist, real media relay for common attachment types, GIF and animation handling, Telegram animated sticker relay to MAX through on-demand `.tgs -> GIF` conversion with a container-local cache, supported Telegram/MAX formatting preservation, repeated-forward unwrap for mirrored bot messages so alias wrappers and forwarded media survive re-forwarding cleanly, bridge commands, and mirrored edit/delete sync with pending-mutation replay.
 - Installer behavior: local PostgreSQL installs now resolve one explicit live cluster or instance before any admin action, prefer preserving existing Maxogram data over blindly picking the newest version, fail closed instead of silently falling back to port `5432` after discovery errors, and deploy the application through Docker Compose instead of host Python and `systemd`.
 - Known limitations: ordinary Telegram chat-history deletions are still not broadly visible to the bot, service/member events are not broadly mirrored yet, proxy DB settings and `media_objects` are not wired into runtime, metrics are collected but not exposed, and secrets still come from `tokens.py` rather than DB-backed credentials.
 - Schema and migrations: one Alembic revision, `20260410_0001`, creates the current SQLAlchemy metadata; there are no later incremental migrations yet.
 - Test coverage: automated tests cover config loading, deduplication, commands, normalization, rendering, pollers, delivery, reconciliation, platform clients, and optional database connectivity.
+
+## 2026-04-18
+
+- Moved the supported runtime baseline from Python `3.13` to Python `3.12` by changing the production `Dockerfile` base image and tightening package metadata in `pyproject.toml` to `>=3.12,<3.13`.
+- Updated Ruff and mypy configuration targets to Python `3.12` so local static analysis matches the supported runtime.
+- Updated `README.md` to state that both production and local development now target Python `3.12`, and that existing Python `3.13` virtual environments are unsupported and should be recreated.
+- Kept the animated sticker `.tgs -> GIF` path unchanged and treated this as a runtime compatibility fix for `pyrlottie` and its `numpy<2` dependency chain rather than a converter refactor.
 
 ## 2026-04-16
 
@@ -29,6 +36,9 @@
 
 - Changed `Telegram -> MAX` audio and voice follow-up text delivery to send as a normal standalone next message instead of a reply to the mirrored MAX audio, while preserving the existing outbox ordering and retry behavior.
 - Updated delivery regression coverage so the auxiliary follow-up task no longer carries `reply_to_message_id`, still appears immediately after the audio in queue order, and still avoids creating an extra `message_mapping`.
+- Added `Telegram -> MAX` animated sticker relay by treating Telegram `.tgs` stickers as relayable image media, converting them to cached GIF files on demand, uploading the resulting GIF to MAX as a normal image, and falling back to text-only delivery when conversion fails instead of retrying the whole message.
+- Added a container-local animated sticker cache under `temp/animated_sticker_cache`, keyed by source media identity plus a conversion profile version, with reuse on cache hits and daily pruning of entries not touched for more than 90 days from the reconciliation worker.
+- Added regression coverage for animated sticker normalization, cache hit and miss materialization, text fallback on conversion failure, cached-media cleanup behavior, and reconciliation cache pruning cadence.
 
 ## 2026-04-10
 

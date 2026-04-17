@@ -5,6 +5,7 @@ Maxogram is a self-hosted Telegram-to-MAX bridge bot built around one Python ser
 Production deployment is Docker-first:
 
 - the application runs from the public image `docker.io/d0ke/maxogram:latest`
+- the published runtime image is based on Python `3.12`
 - PostgreSQL stays on the VPS host or on a remote server
 - `install.sh` manages PostgreSQL discovery/provisioning plus Docker Compose deployment
 
@@ -220,6 +221,8 @@ sudo docker compose -f /opt/maxogram/docker-compose.app.yml down
 
 ## Development Notes
 
+- Local development for this repository must use Python `3.12`.
+- Existing Python `3.13` virtual environments are unsupported and should be recreated with Python `3.12`.
 - Runtime config loading is env-first, with `tokens.py` kept as a local-development fallback.
 - Database schema changes should continue to go through Alembic via `python -m maxogram db-upgrade`.
 - The full runtime and schema reference lives in `architecture.md`.

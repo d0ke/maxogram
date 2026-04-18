@@ -32,6 +32,9 @@
   - `MAX -> Telegram` grouped edits use delete-and-recreate of the mirrored Telegram chunk and replace stored destination member ids after success.
   - grouped deletes remove the whole mirrored chunk instead of only one member.
 - Added targeted regression coverage for grouped normalization, Telegram album aggregation, Telegram native media-group sends, MAX multi-attachment sends/edits, and both grouped edit directions in delivery.
+- Fixed Telegram media-group buffer resequencing so one transaction can ingest multiple album members safely with `autoflush=False`, avoiding the repeated `telegram_media_group_buffer_members_position_uq` crash that had blocked all later normalizer work.
+- Changed Telegram album member ordering to canonical message-id order instead of first-arrival order, so out-of-order Telegram updates still flush into one stable ordered chunk.
+- Added regression coverage for out-of-order Telegram album arrival in the normalizer tests and an optional Postgres-backed repository test that commits one whole media group in a single async session without hitting the former unique-constraint failure.
 
 ## 2026-04-16
 

@@ -187,24 +187,20 @@ class Repository:
             .with_for_update()
         )
         if member is None:
-            max_position = await self.session.scalar(
-                select(func.max(TelegramMediaGroupBufferMember.position)).where(
-                    TelegramMediaGroupBufferMember.buffer_id == buffer.buffer_id
-                )
+            member = TelegramMediaGroupBufferMember(
+                buffer_member_id=uuid.uuid4(),
+                buffer_id=buffer.buffer_id,
+                message_id=message_id,
+                position=0,
+                raw_message=raw_message,
+                updated_at=datetime.now(UTC),
             )
-            self.session.add(
-                TelegramMediaGroupBufferMember(
-                    buffer_member_id=uuid.uuid4(),
-                    buffer_id=buffer.buffer_id,
-                    message_id=message_id,
-                    position=int(max_position or 0) + 1,
-                    raw_message=raw_message,
-                    updated_at=datetime.now(UTC),
-                )
-            )
+            self.session.add(member)
         else:
             member.raw_message = raw_message
             member.updated_at = datetime.now(UTC)
+        await self.session.flush()
+        await self._resequence_telegram_media_group_members(buffer.buffer_id)
 
     async def claim_flushable_telegram_media_groups(
         self,
@@ -1221,6 +1217,52 @@ class Repository:
             dst_message_id=result.dst_message_id,
         )
 
+    async def _resequence_telegram_media_group_members(
+        self,
+        buffer_id: uuid.UUID,
+    ) -> None:
+        members = list(
+            (
+                await self.session.scalars(
+                    select(TelegramMediaGroupBufferMember)
+                    .where(TelegramMediaGroupBufferMember.buffer_id == buffer_id)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        if not members:
+            return
+
+        ordered_members = sorted(
+            members,
+            key=lambda item: _telegram_message_order_key(item.message_id),
+        )
+        expected_positions = {
+            item.buffer_member_id: index
+            for index, item in enumerate(ordered_members, start=1)
+        }
+        original_positions = {
+            item.buffer_member_id: item.position for item in ordered_members
+        }
+        if all(
+            original_positions[item.buffer_member_id]
+            == expected_positions[item.buffer_member_id]
+            for item in ordered_members
+        ):
+            return
+
+        for item in ordered_members:
+            item.position = -expected_positions[item.buffer_member_id]
+        await self.session.flush()
+
+        reordered_at = datetime.now(UTC)
+        for item in ordered_members:
+            final_position = expected_positions[item.buffer_member_id]
+            item.position = final_position
+            if original_positions[item.buffer_member_id] != final_position:
+                item.updated_at = reordered_at
+        await self.session.flush()
+
     async def _get_inflight_outbox(
         self,
         outbox_id: uuid.UUID,
@@ -1264,3 +1306,10 @@ class Repository:
 def _rowcount(result: object) -> int:
     value = getattr(result, "rowcount", 0)
     return int(value or 0)
+
+
+def _telegram_message_order_key(message_id: str) -> tuple[int, int | str]:
+    try:
+        return (0, int(message_id))
+    except (TypeError, ValueError):
+        return (1, message_id)

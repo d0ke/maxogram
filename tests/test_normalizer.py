@@ -166,7 +166,7 @@ class GroupedProcessingRepository(ProcessingRepository):
             self.buffer_members[buffer.buffer_id] = []
         else:
             buffer.pending_flush = True
-            buffer.flush_after = flush_after
+            buffer.flush_after = max(buffer.flush_after, flush_after)
         members = self.buffer_members[buffer.buffer_id]
         existing = next(
             (item for item in members if item.message_id == message_id),
@@ -177,10 +177,12 @@ class GroupedProcessingRepository(ProcessingRepository):
                 SimpleNamespace(
                     message_id=message_id,
                     raw_message=raw_message,
+                    position=0,
                 )
             )
         else:
             existing.raw_message = raw_message
+        _resequence_group_members(members)
 
     async def claim_flushable_telegram_media_groups(self, limit: int) -> list[Any]:
         ready = [
@@ -191,7 +193,8 @@ class GroupedProcessingRepository(ProcessingRepository):
         return ready[:limit]
 
     async def list_telegram_media_group_members(self, buffer_id: uuid.UUID) -> list[Any]:
-        return list(self.buffer_members[buffer_id])
+        members = self.buffer_members[buffer_id]
+        return sorted(members, key=lambda item: item.position)
 
     async def mark_telegram_media_group_flushed(self, buffer: Any) -> None:
         buffer.pending_flush = False
@@ -277,6 +280,22 @@ def make_supported_media_payload(
             },
         }
     }
+
+
+def _resequence_group_members(members: list[Any]) -> None:
+    ordered_members = sorted(
+        members,
+        key=lambda item: _telegram_message_order_key(item.message_id),
+    )
+    for index, member in enumerate(ordered_members, start=1):
+        member.position = index
+
+
+def _telegram_message_order_key(message_id: str) -> tuple[int, int | str]:
+    try:
+        return (0, int(message_id))
+    except (TypeError, ValueError):
+        return (1, message_id)
 
 
 @pytest.mark.asyncio
@@ -820,6 +839,80 @@ async def test_flush_ready_telegram_media_group_enqueues_one_grouped_task():
     assert task["group_key"] == "telegram:-100:grp-1"
     assert task["source_member_message_ids"] == ["300", "301"]
     assert [item["kind"] for item in cast(list[dict[str, Any]], task["media_items"])] == [
+        "image",
+        "video",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_flush_ready_telegram_media_group_orders_members_by_message_id():
+    repo = GroupedProcessingRepository(dst_platform=Platform.MAX, dst_chat_id="200")
+    worker = make_worker()
+    received_at = datetime.now(UTC)
+    updates = [
+        (
+            411,
+            {
+                "photo": [{"file_id": "photo-411", "file_unique_id": "photo-411"}],
+                "caption": "album",
+            },
+        ),
+        (
+            414,
+            {
+                "video": {
+                    "file_id": "video-414",
+                    "file_unique_id": "video-414",
+                    "file_size": 2048,
+                }
+            },
+        ),
+        (
+            413,
+            {
+                "photo": [{"file_id": "photo-413", "file_unique_id": "photo-413"}],
+            },
+        ),
+        (
+            412,
+            {
+                "video": {
+                    "file_id": "video-412",
+                    "file_unique_id": "video-412",
+                    "file_size": 2048,
+                }
+            },
+        ),
+    ]
+
+    for message_id, media_payload in updates:
+        await worker._process_row(
+            repo,
+            Platform.TELEGRAM,
+            {
+                "update_id": message_id,
+                "message": {
+                    "message_id": message_id,
+                    "date": 1_700_000_000 + message_id,
+                    "chat": {"id": -100},
+                    "from": {"id": 42, "first_name": "Alice", "is_bot": False},
+                    "media_group_id": "grp-ordered",
+                    **media_payload,
+                },
+            },
+            uuid.uuid4(),
+            received_at,
+        )
+
+    flushed = await worker._flush_ready_telegram_media_groups(repo)
+
+    assert flushed == 1
+    assert len(repo.enqueued) == 1
+    task = cast(dict[str, Any], repo.enqueued[0]["task"])
+    assert task["source_member_message_ids"] == ["411", "412", "413", "414"]
+    assert [item["kind"] for item in cast(list[dict[str, Any]], task["media_items"])] == [
+        "image",
+        "video",
         "image",
         "video",
     ]

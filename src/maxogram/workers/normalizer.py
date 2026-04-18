@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from maxogram.db.repositories import Repository
@@ -26,6 +27,7 @@ from maxogram.runtime_resilience import (
 from maxogram.services.commands import CommandProcessor
 from maxogram.services.dedup import outbox_dedup_key, partition_key
 from maxogram.services.normalization import NormalizedUpdate, normalize_update
+from maxogram.services.normalization import normalize_telegram_media_group
 from maxogram.services.rendering import (
     default_alias,
     render_audio_caption,
@@ -37,6 +39,8 @@ from maxogram.services.rendering import (
 )
 
 logger = logging.getLogger(__name__)
+
+TELEGRAM_MEDIA_GROUP_QUIET_WINDOW = timedelta(seconds=1)
 
 
 class NormalizerWorker:
@@ -83,20 +87,28 @@ class NormalizerWorker:
 
     async def run_once(self) -> int:
         replies: list[CommandReply] = []
+        processed_rows = 0
+        flushed_groups = 0
         async with self.database.session() as session:
             repo = Repository(session)
             async with session.begin():
                 rows = await repo.claim_inbox(self.batch_size)
                 for row in rows:
                     reply = await self._process_row(
-                        repo, row.platform, row.raw, row.inbox_id
+                        repo,
+                        row.platform,
+                        row.raw,
+                        row.inbox_id,
+                        row.received_at,
                     )
                     if reply:
                         replies.append(reply)
                     await repo.mark_inbox(row, RowStatus.PROCESSED)
+                processed_rows = len(rows)
+                flushed_groups = await self._flush_ready_telegram_media_groups(repo)
         for reply in replies:
             await self._send_command_reply(reply)
-        return len(replies) if replies else len(rows)
+        return processed_rows + flushed_groups
 
     async def _process_row(
         self,
@@ -104,7 +116,10 @@ class NormalizerWorker:
         platform: Platform,
         raw: dict[str, Any],
         inbox_id: uuid.UUID,
+        received_at: datetime | None = None,
     ) -> CommandReply | None:
+        if received_at is None:
+            received_at = datetime.now(UTC)
         normalized = normalize_update(platform, raw)
         if normalized is None or normalized.is_bot_message:
             return None
@@ -135,6 +150,21 @@ class NormalizerWorker:
         if normalized.is_command:
             return await self._process_command(repo, normalized)
 
+        grouped_telegram_message = _grouped_telegram_message(raw, normalized)
+        if grouped_telegram_message is not None:
+            bridge = await repo.find_bridge_by_chat(platform, normalized.chat_id)
+            if bridge is None:
+                return None
+            await repo.buffer_telegram_media_group_update(
+                chat_id=normalized.chat_id,
+                media_group_id=grouped_telegram_message["media_group_id"],
+                group_key=grouped_telegram_message["group_key"],
+                message_id=grouped_telegram_message["message_id"],
+                raw_message=grouped_telegram_message["raw_message"],
+                flush_after=received_at + TELEGRAM_MEDIA_GROUP_QUIET_WINDOW,
+            )
+            return None
+
         bridge = await repo.find_bridge_by_chat(platform, normalized.chat_id)
         if bridge is None:
             return None
@@ -142,67 +172,12 @@ class NormalizerWorker:
         if dst_chat is None or normalized.message_id is None:
             return None
 
-        dst_platform = dst_chat.platform
-        payload = await self._build_payload(
+        await self._enqueue_relay_event(
             repo,
             normalized,
-            bridge.bridge_id,
-            dst_platform=dst_platform,
-        )
-        payload["dst"] = {"platform": dst_platform.value, "chat_id": dst_chat.chat_id}
-        event_id = await repo.insert_canonical_event(
             bridge_id=bridge.bridge_id,
-            dedup_key=normalized.dedup_key,
-            src_platform=platform,
-            src_chat_id=normalized.chat_id,
-            src_user_id=normalized.user_id,
-            src_message_id=normalized.message_id,
-            event_type=normalized.event_type.value,
-            happened_at=normalized.happened_at,
-            payload=payload,
+            dst_chat=dst_chat,
             raw_inbox_id=inbox_id,
-        )
-        if event_id is None:
-            return None
-
-        action = _action_for_event(normalized.event_type)
-        if action in {OutboxAction.EDIT, OutboxAction.DELETE}:
-            mapping = await repo.find_mapping_by_source(
-                bridge.bridge_id,
-                platform,
-                normalized.chat_id,
-                normalized.message_id,
-            )
-            if mapping is None:
-                await repo.insert_pending_mutation(
-                    bridge_id=bridge.bridge_id,
-                    dedup_key=normalized.dedup_key,
-                    src_platform=platform,
-                    src_chat_id=normalized.chat_id,
-                    src_message_id=normalized.message_id,
-                    mutation_type=action.value,
-                    payload=payload,
-                )
-                return None
-            payload["dst_message_id"] = mapping.dst_message_id
-
-        version_key = _payload_version(payload)
-        await repo.enqueue_outbox(
-            bridge_id=bridge.bridge_id,
-            dedup_key=outbox_dedup_key(
-                bridge.bridge_id,
-                platform,
-                normalized.chat_id,
-                normalized.message_id,
-                dst_platform,
-                action,
-                version_key,
-            ),
-            src_event_id=event_id,
-            dst_platform=dst_platform,
-            action=action,
-            partition_key=partition_key(bridge.bridge_id, platform, dst_platform),
-            task=payload,
         )
         return None
 
@@ -233,12 +208,38 @@ class NormalizerWorker:
             normalized,
         )
         media = _supported_media_payload(normalized.payload)
-        media_kind = (
-            str(media.get("kind"))
-            if media is not None and media.get("kind") is not None
+        media_group = _supported_media_group_payload(normalized.payload)
+        media_items = (
+            _media_group_items(media_group) if media_group is not None else None
+        )
+        group_kind = (
+            str(media_group.get("group_kind")) if media_group is not None else None
+        )
+        group_key = (
+            str(media_group.get("group_key")) if media_group is not None else None
+        )
+        source_member_message_ids = (
+            _media_group_source_member_ids(media_group)
+            if media_group is not None
             else None
         )
+        has_media_payload = media is not None or media_group is not None
+        media_kind = (
+            group_kind
+            if group_kind is not None
+            else (
+                str(media.get("kind"))
+                if media is not None and media.get("kind") is not None
+                else None
+            )
+        )
         placeholder = _media_text_hint(normalized.payload)
+        if placeholder is None and media_group is not None:
+            placeholder = (
+                str(media_group.get("text_hint"))
+                if media_group.get("text_hint") is not None
+                else None
+            )
         post_send_text_plain: str | None = None
         post_send_text_html: str | None = None
         if media is not None and media_kind in {"audio", "voice"}:
@@ -265,7 +266,7 @@ class NormalizerWorker:
                 rendered_plain = audio_text_plain
                 rendered_html = audio_text_html
                 fallback_text = audio_text_plain
-        elif media is not None:
+        elif has_media_payload:
             rendered_plain = render_media_caption(
                 alias,
                 normalized.text,
@@ -322,9 +323,13 @@ class NormalizerWorker:
             "fallback_text": fallback_text,
             "reply_to_message_id": reply_to_dst_id,
             "raw": normalized.payload or {},
-            "has_media": media is not None,
+            "has_media": has_media_payload,
             "media_kind": media_kind,
             "media": media,
+            "media_items": media_items,
+            "group_kind": group_kind,
+            "group_key": group_key,
+            "source_member_message_ids": source_member_message_ids,
             "version": normalized.event_version,
         }
         if post_send_text_plain is not None:
@@ -332,6 +337,117 @@ class NormalizerWorker:
         if post_send_text_html is not None:
             payload["post_send_text_html"] = post_send_text_html
         return payload
+
+    async def _flush_ready_telegram_media_groups(self, repo: Repository) -> int:
+        flushed = 0
+        buffers = await repo.claim_flushable_telegram_media_groups(self.batch_size)
+        for buffer in buffers:
+            members = await repo.list_telegram_media_group_members(buffer.buffer_id)
+            raw_members = [member.raw_message for member in members]
+            normalized = normalize_telegram_media_group(
+                group_key=buffer.group_key,
+                members=raw_members,
+                has_flushed=buffer.has_flushed,
+            )
+            await repo.mark_telegram_media_group_flushed(buffer)
+            if normalized is None or normalized.message_id is None:
+                continue
+
+            bridge = await repo.find_bridge_by_chat(Platform.TELEGRAM, buffer.chat_id)
+            if bridge is None:
+                continue
+            dst_chat = await repo.find_other_chat(bridge.bridge_id, Platform.TELEGRAM)
+            if dst_chat is None:
+                continue
+            await self._enqueue_relay_event(
+                repo,
+                normalized,
+                bridge_id=bridge.bridge_id,
+                dst_chat=dst_chat,
+                raw_inbox_id=None,
+            )
+            flushed += 1
+        return flushed
+
+    async def _enqueue_relay_event(
+        self,
+        repo: Repository,
+        normalized: NormalizedUpdate,
+        *,
+        bridge_id: uuid.UUID,
+        dst_chat: Any,
+        raw_inbox_id: uuid.UUID | None,
+    ) -> None:
+        dst_platform = dst_chat.platform
+        payload = await self._build_payload(
+            repo,
+            normalized,
+            bridge_id,
+            dst_platform=dst_platform,
+        )
+        payload["dst"] = {"platform": dst_platform.value, "chat_id": dst_chat.chat_id}
+        event_id = await repo.insert_canonical_event(
+            bridge_id=bridge_id,
+            dedup_key=normalized.dedup_key,
+            src_platform=normalized.platform,
+            src_chat_id=normalized.chat_id,
+            src_user_id=normalized.user_id,
+            src_message_id=normalized.message_id,
+            event_type=normalized.event_type.value,
+            happened_at=normalized.happened_at,
+            payload=payload,
+            raw_inbox_id=raw_inbox_id,
+        )
+        if event_id is None or normalized.message_id is None:
+            return
+
+        action = _action_for_event(normalized.event_type)
+        if action in {OutboxAction.EDIT, OutboxAction.DELETE}:
+            mapping = await repo.find_mapping_by_source(
+                bridge_id,
+                normalized.platform,
+                normalized.chat_id,
+                normalized.message_id,
+            )
+            if mapping is None:
+                await repo.insert_pending_mutation(
+                    bridge_id=bridge_id,
+                    dedup_key=normalized.dedup_key,
+                    src_platform=normalized.platform,
+                    src_chat_id=normalized.chat_id,
+                    src_message_id=normalized.message_id,
+                    mutation_type=action.value,
+                    payload=payload,
+                )
+                return
+            payload["dst_message_id"] = mapping.dst_message_id
+            dst_message_ids = await repo.list_destination_message_ids(
+                bridge_id,
+                normalized.platform,
+                normalized.chat_id,
+                normalized.message_id,
+            )
+            if dst_message_ids:
+                payload["dst_message_ids"] = dst_message_ids
+
+        version_key = _payload_version(payload)
+        await repo.enqueue_outbox(
+            bridge_id=bridge_id,
+            dedup_key=outbox_dedup_key(
+                bridge_id,
+                normalized.platform,
+                normalized.chat_id,
+                normalized.message_id,
+                dst_platform,
+                action,
+                version_key,
+            ),
+            src_event_id=event_id,
+            dst_platform=dst_platform,
+            action=action,
+            partition_key=partition_key(bridge_id, normalized.platform, dst_platform),
+            task=payload,
+        )
 
     async def _resolve_reply_target(
         self,
@@ -439,12 +555,65 @@ def _supported_media_payload(payload: dict[str, Any] | None) -> dict[str, Any] |
     return media_payload if isinstance(media_payload, dict) else None
 
 
+def _supported_media_group_payload(
+    payload: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    media_group = payload.get("media_group") if isinstance(payload, dict) else None
+    if not isinstance(media_group, dict) or not media_group.get("supported"):
+        return None
+    if media_group.get("group_kind") != "photo_video_chunk":
+        return None
+    items = media_group.get("items")
+    if not isinstance(items, list) or not items:
+        return None
+    return media_group
+
+
+def _media_group_items(media_group: dict[str, Any]) -> list[dict[str, Any]]:
+    items = media_group.get("items")
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+def _media_group_source_member_ids(media_group: dict[str, Any]) -> list[str]:
+    values = media_group.get("source_member_message_ids")
+    if not isinstance(values, list):
+        return []
+    return [str(value) for value in values if value is not None]
+
+
 def _media_text_hint(payload: dict[str, Any] | None) -> str | None:
     media = payload.get("media") if isinstance(payload, dict) else None
     if not isinstance(media, dict):
         return None
     text_hint = media.get("text_hint")
     return str(text_hint) if text_hint is not None else None
+
+
+def _grouped_telegram_message(
+    raw: dict[str, Any],
+    normalized: NormalizedUpdate,
+) -> dict[str, str | dict[str, Any]] | None:
+    if normalized.platform != Platform.TELEGRAM:
+        return None
+    raw_message = raw.get("message")
+    if raw_message is None and raw.get("edited_message") is not None:
+        raw_message = raw["edited_message"]
+    if not isinstance(raw_message, dict):
+        return None
+    media_group_id = raw_message.get("media_group_id")
+    if media_group_id is None:
+        return None
+    media = _supported_media_payload(normalized.payload)
+    if media is None or str(media.get("kind")) not in {"image", "video"}:
+        return None
+    if normalized.message_id is None:
+        return None
+    return {
+        "group_key": f"{Platform.TELEGRAM.value}:{normalized.chat_id}:{media_group_id}",
+        "media_group_id": str(media_group_id),
+        "message_id": normalized.message_id,
+        "raw_message": raw_message,
+    }
 
 
 def _payload_version(payload: dict[str, object]) -> str | int | None:

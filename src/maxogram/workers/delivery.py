@@ -31,6 +31,7 @@ class EditMode(StrEnum):
     TEXT_ONLY = "text_only"
     CAPTION_ONLY_SAME_MEDIA = "caption_only_same_media"
     REPLACE_MEDIA = "replace_media"
+    REPLACE_MEDIA_GROUP = "replace_media_group"
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +55,7 @@ class DeliveryContext:
 @dataclass(frozen=True, slots=True)
 class DeliveryResult:
     dst_message_id: str | None = None
+    dst_message_ids: tuple[str, ...] = ()
     sent_with_media: bool = False
 
 
@@ -206,6 +208,13 @@ class DeliveryWorker:
         if context.action == OutboxAction.SEND:
             return await self._send_message(client, payload, context.dst_chat_id)
         if context.action == OutboxAction.EDIT:
+            if context.edit_mode == EditMode.REPLACE_MEDIA_GROUP:
+                return await self._edit_media_group(
+                    client,
+                    payload,
+                    context.dst_chat_id,
+                    context.dst_platform,
+                )
             replacement_media = None
             try:
                 if context.edit_mode == EditMode.REPLACE_MEDIA:
@@ -239,6 +248,13 @@ class DeliveryWorker:
             finally:
                 cleanup_local_media(replacement_media)
         if context.action == OutboxAction.DELETE:
+            if _is_media_group_payload(payload):
+                for message_id in _payload_dst_message_ids(payload):
+                    await client.delete_message(
+                        context.dst_chat_id,
+                        message_id,
+                    )
+                return DeliveryResult()
             await client.delete_message(
                 context.dst_chat_id,
                 str(payload["dst_message_id"]),
@@ -257,15 +273,19 @@ class DeliveryWorker:
         chat_id: str,
     ) -> DeliveryResult:
         media = _optional_dict(payload.get("media"))
+        media_items = _payload_media_items(payload)
         local_media = None
+        local_media_items: list[Any] = []
         try:
-            if media is not None:
+            if media_items:
+                local_media_items = await self._materialize_media_items(media_items)
+            elif media is not None:
                 local_media = await materialize_media(
                     clients=self.clients,
                     media=media,
                     root_dir=self.root_dir,
                 )
-            if media is None:
+            if media is None and not media_items:
                 result = await client.send_text(
                     chat_id,
                     _payload_text_plain(payload),
@@ -275,7 +295,16 @@ class DeliveryWorker:
                     ),
                 )
                 return DeliveryResult(dst_message_id=result.message_id)
-            if local_media is None:
+            if media_items and not local_media_items:
+                result = await client.send_text(
+                    chat_id,
+                    _payload_fallback_text(payload),
+                    reply_to_message_id=_optional_str(
+                        payload.get("reply_to_message_id")
+                    ),
+                )
+                return DeliveryResult(dst_message_id=result.message_id)
+            if media is not None and local_media is None:
                 result = await client.send_text(
                     chat_id,
                     _payload_fallback_text(payload),
@@ -289,14 +318,22 @@ class DeliveryWorker:
                 _payload_text_plain(payload),
                 text_html=_payload_text_html(payload),
                 reply_to_message_id=_optional_str(payload.get("reply_to_message_id")),
-                media=local_media,
+                media=local_media_items or local_media,
+            )
+            dst_message_ids = (
+                result.member_message_ids
+                if result.member_message_ids
+                else ((result.message_id,) if result.message_id else ())
             )
             return DeliveryResult(
                 dst_message_id=result.message_id,
+                dst_message_ids=dst_message_ids,
                 sent_with_media=True,
             )
         finally:
             cleanup_local_media(local_media)
+            for item in local_media_items:
+                cleanup_local_media(item)
 
     async def _classify_edit_mode(
         self,
@@ -308,6 +345,8 @@ class DeliveryWorker:
     ) -> EditMode:
         if action != OutboxAction.EDIT:
             return EditMode.TEXT_ONLY
+        if _is_media_group_payload(payload):
+            return EditMode.REPLACE_MEDIA_GROUP
         current_media = _optional_dict(payload.get("media"))
         src = _expect_dict(payload.get("src"), "src")
         src_platform = _parse_platform(src.get("platform"), "src.platform")
@@ -382,6 +421,64 @@ class DeliveryWorker:
         )
         return mode
 
+    async def _edit_media_group(
+        self,
+        client: PlatformClient,
+        payload: dict[str, Any],
+        chat_id: str,
+        dst_platform: Platform,
+    ) -> DeliveryResult:
+        if dst_platform == Platform.TELEGRAM:
+            for message_id in _payload_dst_message_ids(payload):
+                await client.delete_message(chat_id, message_id)
+            return await self._send_message(client, payload, chat_id)
+
+        media_items = _payload_media_items(payload)
+        if not media_items:
+            raise PlatformDeliveryError(
+                "Mirrored media group edit is missing media_items",
+                retryable=False,
+                code="invalid_media_group_payload",
+            )
+        local_media_items = await self._materialize_media_items(media_items)
+        if not local_media_items:
+            raise PlatformDeliveryError(
+                "Replacement media group for edit is unavailable",
+                retryable=False,
+                code="replacement_media_unavailable",
+            )
+        try:
+            await client.edit_message(
+                chat_id,
+                str(payload["dst_message_id"]),
+                _payload_text_plain(payload),
+                text_html=_payload_text_html(payload),
+                has_media=True,
+                replacement_media=local_media_items,
+            )
+        finally:
+            for item in local_media_items:
+                cleanup_local_media(item)
+        return DeliveryResult()
+
+    async def _materialize_media_items(
+        self,
+        media_items: list[dict[str, Any]],
+    ) -> list[Any]:
+        local_media_items: list[Any] = []
+        for media in media_items:
+            local_media = await materialize_media(
+                clients=self.clients,
+                media=media,
+                root_dir=self.root_dir,
+            )
+            if local_media is None:
+                for item in local_media_items:
+                    cleanup_local_media(item)
+                return []
+            local_media_items.append(local_media)
+        return local_media_items
+
     async def _lease_heartbeat(
         self,
         context: DeliveryContext,
@@ -441,9 +538,14 @@ class DeliveryWorker:
                     dst_platform=context.dst_platform,
                     dst_chat_id=context.dst_chat_id,
                     dst_message_id=result.dst_message_id,
+                    dst_message_ids=list(result.dst_message_ids),
                     src_platform=src_platform,
                     src_chat_id=src_chat_id,
                     src_message_id=src_message_id,
+                    group_kind=_payload_group_kind(context.payload),
+                    src_member_message_ids=_payload_source_member_message_ids(
+                        context.payload
+                    ),
                 )
                 if finalized and post_send_payload is not None:
                     if context.src_event_id is None:
@@ -614,6 +716,43 @@ def _payload_post_send_text_html(payload: dict[str, Any]) -> str | None:
     if isinstance(value, str) and value:
         return value
     return None
+
+
+def _payload_media_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    items = payload.get("media_items")
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _payload_group_kind(payload: dict[str, Any]) -> str | None:
+    value = payload.get("group_kind")
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _payload_source_member_message_ids(payload: dict[str, Any]) -> list[str]:
+    values = payload.get("source_member_message_ids")
+    if not isinstance(values, list):
+        return []
+    return [str(value) for value in values if value is not None]
+
+
+def _payload_dst_message_ids(payload: dict[str, Any]) -> list[str]:
+    values = payload.get("dst_message_ids")
+    if isinstance(values, list):
+        result = [str(value) for value in values if value is not None]
+        if result:
+            return result
+    message_id = _optional_str(payload.get("dst_message_id"))
+    return [message_id] if message_id is not None else []
+
+
+def _is_media_group_payload(payload: dict[str, Any]) -> bool:
+    return _payload_group_kind(payload) == "photo_video_chunk" and bool(
+        _payload_media_items(payload)
+    )
 
 
 def _payload_creates_mapping(payload: dict[str, Any]) -> bool:

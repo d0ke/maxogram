@@ -101,7 +101,7 @@ class FakeClient:
         *,
         text_html: str | None = None,
         reply_to_message_id: str | None = None,
-        media: LocalMediaFile | None = None,
+        media: LocalMediaFile | list[LocalMediaFile] | None = None,
     ) -> SendResult:
         self._assert_no_active_transaction()
         if self.on_send_message is not None:
@@ -121,9 +121,21 @@ class FakeClient:
         )
         if self.send_delay:
             await asyncio.sleep(self.send_delay)
+        member_message_ids: tuple[str, ...] = ()
+        if isinstance(media, list) and media:
+            member_message_ids = tuple(
+                f"{self.name}-media-{len(self.send_message_calls)}-{index}"
+                for index in range(1, len(media) + 1)
+            )
+        message_id = (
+            member_message_ids[0]
+            if member_message_ids
+            else f"{self.name}-media-{len(self.send_message_calls)}"
+        )
         return SendResult(
-            message_id=f"{self.name}-media-{len(self.send_message_calls)}",
+            message_id=message_id,
             raw={"mode": "media"},
+            member_message_ids=member_message_ids,
         )
 
     async def edit_message(
@@ -134,7 +146,7 @@ class FakeClient:
         *,
         text_html: str | None = None,
         has_media: bool = False,
-        replacement_media: LocalMediaFile | None = None,
+        replacement_media: LocalMediaFile | list[LocalMediaFile] | None = None,
     ) -> None:
         self.edit_calls.append(
             {
@@ -295,10 +307,14 @@ class FakeRepository:
         dst_platform: Platform,
         dst_chat_id: str,
         dst_message_id: str | None,
+        dst_message_ids: list[str] | None,
         src_platform: Platform | None,
         src_chat_id: str | None,
         src_message_id: str | None,
+        group_kind: str | None = None,
+        src_member_message_ids: list[str] | None = None,
     ) -> bool:
+        _ = dst_message_ids, group_kind, src_member_message_ids
         task = self.state.tasks.get(outbox_id)
         if task is None:
             return False
@@ -417,6 +433,23 @@ class FakeRepository:
             ):
                 return SimpleNamespace(**mapping)
         return None
+
+    async def list_destination_message_ids(
+        self,
+        bridge_id: uuid.UUID,
+        src_platform: Platform,
+        src_chat_id: str,
+        src_message_id: str,
+    ) -> list[str]:
+        for mapping in self.state.mappings:
+            if (
+                mapping["bridge_id"] == bridge_id
+                and mapping["src_platform"] == src_platform
+                and mapping["src_chat_id"] == src_chat_id
+                and mapping["src_message_id"] == src_message_id
+            ):
+                return [mapping["dst_message_id"]]
+        return []
 
     async def find_canonical_event_id_by_dedup_key(
         self,
@@ -744,6 +777,63 @@ async def test_delivery_sends_telegram_photo_to_max_as_media(tmp_path: Path):
     assert send_call["media"].kind == MediaKind.IMAGE
     assert not send_call["media"].path.exists()
     assert result.dst_message_id == "max-media-1"
+
+
+@pytest.mark.asyncio
+async def test_delivery_sends_max_photo_video_chunk_to_telegram_as_media_group(
+    tmp_path: Path,
+):
+    telegram = FakeClient("telegram")
+    max_client = FakeClient("max", download_kind=MediaKind.IMAGE)
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+    )
+    context = make_context(
+        action="send",
+        bridge_id=uuid.uuid4(),
+        dst_platform=Platform.TELEGRAM,
+        task_payload={
+            "src": {"platform": "max", "chat_id": "300", "message_id": "mid-group"},
+            "dst": {"platform": "telegram", "chat_id": "-100"},
+            "text": "Alice: album",
+            "fallback_text": "Alice: [photo/video group]",
+            "has_media": True,
+            "media_kind": "photo_video_chunk",
+            "group_kind": "photo_video_chunk",
+            "group_key": "max:300:mid-group",
+            "media": None,
+            "media_items": [
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-1",
+                    filename="one.jpg",
+                    mime_type="image/jpeg",
+                ),
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-2",
+                    filename="two.jpg",
+                    mime_type="image/jpeg",
+                ),
+            ],
+        },
+    )
+
+    result = await worker._call_platform(context)
+
+    assert len(max_client.download_calls) == 2
+    assert len(telegram.send_message_calls) == 1
+    send_call = telegram.send_message_calls[0]
+    assert isinstance(send_call["media"], list)
+    assert len(send_call["media"]) == 2
+    assert result.dst_message_id == "telegram-media-1-1"
+    assert result.dst_message_ids == ("telegram-media-1-1", "telegram-media-1-2")
 
 
 @pytest.mark.asyncio
@@ -1638,6 +1728,124 @@ async def test_delivery_replaces_media_on_telegram_edit(tmp_path: Path):
     input_media = cast(Any, telegram_bot.edit_message_media_calls[0]["media"])
     assert input_media.__class__.__name__ == "InputMediaPhoto"
     assert input_media.caption == "Alice: updated"
+
+
+@pytest.mark.asyncio
+async def test_delivery_recreates_telegram_media_group_on_group_edit(
+    tmp_path: Path,
+):
+    telegram = FakeClient("telegram")
+    max_client = FakeClient("max", download_kind=MediaKind.IMAGE)
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+    )
+    context = make_context(
+        action="edit",
+        bridge_id=uuid.uuid4(),
+        dst_platform=Platform.TELEGRAM,
+        task_payload={
+            "src": {"platform": "max", "chat_id": "300", "message_id": "mid-group"},
+            "dst": {"platform": "telegram", "chat_id": "-100"},
+            "dst_message_id": "old-1",
+            "dst_message_ids": ["old-1", "old-2"],
+            "text": "Alice: updated album",
+            "has_media": True,
+            "media": None,
+            "group_kind": "photo_video_chunk",
+            "group_key": "max:300:mid-group",
+            "media_items": [
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-1",
+                    filename="one.jpg",
+                    mime_type="image/jpeg",
+                ),
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-2",
+                    filename="two.jpg",
+                    mime_type="image/jpeg",
+                ),
+            ],
+        },
+        edit_mode=EditMode.REPLACE_MEDIA_GROUP,
+    )
+
+    result = await worker._call_platform(context)
+
+    assert telegram.delete_calls == [
+        {"chat_id": "-100", "message_id": "old-1"},
+        {"chat_id": "-100", "message_id": "old-2"},
+    ]
+    assert len(telegram.send_message_calls) == 1
+    send_call = telegram.send_message_calls[0]
+    assert isinstance(send_call["media"], list)
+    assert result.dst_message_id == "telegram-media-1-1"
+    assert result.dst_message_ids == ("telegram-media-1-1", "telegram-media-1-2")
+
+
+@pytest.mark.asyncio
+async def test_delivery_replaces_max_media_group_with_full_attachment_array(
+    tmp_path: Path,
+):
+    telegram = FakeClient("telegram", download_kind=MediaKind.IMAGE)
+    max_client = FakeClient("max")
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+    )
+    context = make_context(
+        action="edit",
+        bridge_id=uuid.uuid4(),
+        dst_platform=Platform.MAX,
+        task_payload={
+            "src": {
+                "platform": "telegram",
+                "chat_id": "-100",
+                "message_id": "telegram:-100:grp-1",
+            },
+            "dst": {"platform": "max", "chat_id": "200"},
+            "dst_message_id": "max-msg-1",
+            "text": "Alice: updated album",
+            "has_media": True,
+            "media": None,
+            "group_kind": "photo_video_chunk",
+            "group_key": "telegram:-100:grp-1",
+            "media_items": [
+                media_payload(
+                    source_platform=Platform.TELEGRAM,
+                    kind="image",
+                    identity="telegram:image:id:file-1",
+                    filename="one.jpg",
+                    mime_type="image/jpeg",
+                ),
+                media_payload(
+                    source_platform=Platform.TELEGRAM,
+                    kind="image",
+                    identity="telegram:image:id:file-2",
+                    filename="two.jpg",
+                    mime_type="image/jpeg",
+                ),
+            ],
+        },
+        edit_mode=EditMode.REPLACE_MEDIA_GROUP,
+    )
+
+    await worker._call_platform(context)
+
+    assert len(telegram.download_calls) == 2
+    assert len(max_client.edit_calls) == 1
+    replacement_media = cast(list[Any], max_client.edit_calls[0]["replacement_media"])
+    assert len(replacement_media) == 2
 
 
 @pytest.mark.asyncio

@@ -3,10 +3,10 @@
 ## Current State
 
 - Runtime: the project runs as a single asyncio process with five worker loops: Telegram poller, MAX poller, normalizer, delivery, and reconciliation. Production configuration is env-first with `tokens.py` kept as a fallback for local development, the public deployment artifact is a Docker image based on Python `3.12`, local development is expected to use Python `3.12`, and PostgreSQL is the only durable store for state and queueing.
-- Supported behavior: bidirectional text relay with alias prefixes, native replies where mappings exist, real media relay for common attachment types, GIF and animation handling, Telegram animated sticker relay to MAX through on-demand `.tgs -> GIF` conversion with a container-local cache, supported Telegram/MAX formatting preservation, repeated-forward unwrap for mirrored bot messages so alias wrappers and forwarded media survive re-forwarding cleanly, bridge commands, and mirrored edit/delete sync with pending-mutation replay.
+- Supported behavior: bidirectional text relay with alias prefixes, native replies where mappings exist, real media relay for common attachment types, grouped photo/video chunk relay between Telegram and MAX, GIF and animation handling, Telegram animated sticker relay to MAX through on-demand `.tgs -> GIF` conversion with a container-local cache, supported Telegram/MAX formatting preservation, repeated-forward unwrap for mirrored bot messages so alias wrappers and forwarded media survive re-forwarding cleanly, bridge commands, and mirrored edit/delete sync with pending-mutation replay.
 - Installer behavior: local PostgreSQL installs now resolve one explicit live cluster or instance before any admin action, prefer preserving existing Maxogram data over blindly picking the newest version, fail closed instead of silently falling back to port `5432` after discovery errors, and deploy the application through Docker Compose instead of host Python and `systemd`.
 - Known limitations: ordinary Telegram chat-history deletions are still not broadly visible to the bot, service/member events are not broadly mirrored yet, proxy DB settings and `media_objects` are not wired into runtime, metrics are collected but not exposed, and secrets still come from `tokens.py` rather than DB-backed credentials.
-- Schema and migrations: one Alembic revision, `20260410_0001`, creates the current SQLAlchemy metadata; there are no later incremental migrations yet.
+- Schema and migrations: two Alembic revisions now exist. `20260410_0001` creates the baseline schema, and `20260419_0002` adds persistent Telegram media-group buffering plus logical chunk/member mapping tables for grouped photo/video sync.
 - Test coverage: automated tests cover config loading, deduplication, commands, normalization, rendering, pollers, delivery, reconciliation, platform clients, and optional database connectivity.
 
 ## 2026-04-18
@@ -19,6 +19,19 @@
 - Updated `README.md` to state that both production and local development now target Python `3.12`, and that existing Python `3.13` virtual environments are unsupported and should be recreated.
 - Reworked `README.md` copy to be more user-friendly by simplifying the installer description, renaming the production setup section, clarifying sticker and animation support, removing extra installer wording, and adding a direct `Storage and Privacy` section that explains what PostgreSQL stores, what stays temporary on disk, and which retention rules exist today.
 - Kept the animated sticker `.tgs -> GIF` path unchanged and treated this as a runtime compatibility fix for `pyrlottie` and its `numpy<2` dependency chain rather than a converter refactor.
+
+## 2026-04-19
+
+- Added native grouped `photo/video` chunk relay between Telegram and MAX, including mixed `photo + video` chunks, while keeping existing single-message media flows unchanged.
+- Reworked normalization so one MAX message with multiple supported `image/video` attachments becomes one logical chunk event with ordered `media_items[]`, stable `group_key`, and chunk-scoped caption handling.
+- Added durable Telegram media-group buffering with a quiet-window flush model keyed by `telegram:<chat_id>:<media_group_id>`, so Telegram album members are aggregated into one canonical chunk event instead of being mirrored as separate MAX messages.
+- Added persistent logical chunk and ordered member mapping tables so replies, edits, deletes, and chunk recreation can resolve `many Telegram member ids <-> one mirrored chunk` without overloading ordinary single-message mappings.
+- Updated delivery so:
+  - `Telegram -> MAX` grouped photo/video sends and edits use one MAX message with the full ordered attachments array.
+  - `MAX -> Telegram` grouped sends use Telegram media groups, defensively split oversized payloads into `<=10` items per outbound album call, and place the caption only on the first emitted item.
+  - `MAX -> Telegram` grouped edits use delete-and-recreate of the mirrored Telegram chunk and replace stored destination member ids after success.
+  - grouped deletes remove the whole mirrored chunk instead of only one member.
+- Added targeted regression coverage for grouped normalization, Telegram album aggregation, Telegram native media-group sends, MAX multi-attachment sends/edits, and both grouped edit directions in delivery.
 
 ## 2026-04-16
 

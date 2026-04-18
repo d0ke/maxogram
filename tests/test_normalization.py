@@ -5,7 +5,10 @@ from typing import Any
 from maxogram.domain import EventType, Platform
 from maxogram.services.dedup import stable_json_hash
 from maxogram.services.media import TELEGRAM_DOWNLOAD_LIMIT_BYTES
-from maxogram.services.normalization import normalize_update
+from maxogram.services.normalization import (
+    normalize_telegram_media_group,
+    normalize_update,
+)
 
 
 def test_normalize_telegram_text_message():
@@ -1124,6 +1127,86 @@ def test_normalize_max_video_attachment_uses_best_video_url():
     assert media["payload"]["identity"].startswith("max:video:path:")
 
 
+def test_normalize_max_multi_photo_video_message_builds_media_group_payload():
+    normalized = normalize_update(
+        Platform.MAX,
+        {
+            "update_type": "message_created",
+            "message": {
+                "recipient": {"chat_id": 100},
+                "sender": {"user_id": 42, "first_name": "Alice"},
+                "body": {
+                    "mid": "mid-group",
+                    "seq": 10,
+                    "text": "album",
+                    "attachments": [
+                        {
+                            "type": "image",
+                            "payload": {
+                                "photo_id": 123,
+                                "url": "https://example.test/photo.jpg",
+                            },
+                        },
+                        {
+                            "type": "video",
+                            "token": "video-token",
+                            "urls": {
+                                "mp4_720": "https://example.test/video-720.mp4",
+                            },
+                        },
+                    ],
+                },
+            },
+        },
+    )
+
+    assert normalized is not None
+    media_group = _media_group_payload(normalized.payload)
+    assert media_group["group_kind"] == "photo_video_chunk"
+    assert media_group["group_key"] == "max:100:mid-group"
+    assert [item["kind"] for item in media_group["items"]] == ["image", "video"]
+    assert media_group["text_hint"] == "[photo/video group]"
+
+
+def test_normalize_telegram_media_group_builds_ordered_items_and_caption():
+    normalized = normalize_telegram_media_group(
+        group_key="telegram:-100:grp-1",
+        members=[
+            {
+                "message_id": 10,
+                "date": 1_700_000_000,
+                "chat": {"id": -100},
+                "from": {"id": 42, "first_name": "Alice", "is_bot": False},
+                "media_group_id": "grp-1",
+                "caption": "album",
+                "photo": [{"file_id": "photo-1", "file_unique_id": "photo-1"}],
+            },
+            {
+                "message_id": 11,
+                "date": 1_700_000_001,
+                "chat": {"id": -100},
+                "from": {"id": 42, "first_name": "Alice", "is_bot": False},
+                "media_group_id": "grp-1",
+                "video": {
+                    "file_id": "video-1",
+                    "file_unique_id": "video-1",
+                    "file_size": 2048,
+                },
+            },
+        ],
+        has_flushed=False,
+    )
+
+    assert normalized is not None
+    assert normalized.event_type == EventType.MESSAGE_CREATED
+    assert normalized.message_id == "telegram:-100:grp-1"
+    assert normalized.text == "album"
+    media_group = _media_group_payload(normalized.payload)
+    assert media_group["group_kind"] == "photo_video_chunk"
+    assert media_group["source_member_message_ids"] == ["10", "11"]
+    assert [item["kind"] for item in media_group["items"]] == ["image", "video"]
+
+
 def test_normalize_max_file_and_sticker_attachments():
     file_update = normalize_update(
         Platform.MAX,
@@ -1187,3 +1270,10 @@ def _media_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
     media = payload.get("media")
     assert isinstance(media, dict)
     return media
+
+
+def _media_group_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
+    assert payload is not None
+    media_group = payload.get("media_group")
+    assert isinstance(media_group, dict)
+    return media_group

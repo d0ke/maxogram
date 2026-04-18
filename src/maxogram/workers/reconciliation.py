@@ -114,6 +114,14 @@ class ReconciliationWorker:
                 "dst": dst_payload,
                 "dst_message_id": mapping.dst_message_id,
             }
+            dst_message_ids = await repo.list_destination_message_ids(
+                pending.bridge_id,
+                pending.src_platform,
+                pending.src_chat_id,
+                pending.src_message_id,
+            )
+            if dst_message_ids:
+                payload["dst_message_ids"] = dst_message_ids
             version = payload.get("version")
             version_key = version if isinstance(version, str | int) else None
             dst_platform = Platform(str(dst_payload["platform"]))

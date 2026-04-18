@@ -51,6 +51,18 @@ class FakeRepository:
         _ = bridge_id, src_platform, src_chat_id, src_message_id
         return self.mapping
 
+    async def list_destination_message_ids(
+        self,
+        bridge_id: uuid.UUID,
+        src_platform: Platform,
+        src_chat_id: str,
+        src_message_id: str,
+    ) -> list[str]:
+        _ = bridge_id, src_platform, src_chat_id, src_message_id
+        if self.mapping is None:
+            return []
+        return [self.mapping.dst_message_id]
+
     async def find_canonical_event_id_by_dedup_key(
         self, dedup_key: str
     ) -> uuid.UUID | None:

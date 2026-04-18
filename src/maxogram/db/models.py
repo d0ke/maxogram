@@ -247,6 +247,80 @@ class InboxUpdate(Base):
     )
 
 
+class TelegramMediaGroupBuffer(Base):
+    __tablename__ = "telegram_media_group_buffers"
+    __table_args__ = (
+        UniqueConstraint("group_key"),
+        Index(
+            "telegram_media_group_buffers_flush_idx",
+            "pending_flush",
+            "flush_after",
+        ),
+    )
+
+    buffer_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    group_key: Mapped[str] = mapped_column(Text, nullable=False)
+    chat_id: Mapped[str] = mapped_column(Text, nullable=False)
+    media_group_id: Mapped[str] = mapped_column(Text, nullable=False)
+    anchor_message_id: Mapped[str | None] = mapped_column(Text)
+    pending_flush: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true"
+    )
+    has_flushed: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
+    flush_after: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class TelegramMediaGroupBufferMember(Base):
+    __tablename__ = "telegram_media_group_buffer_members"
+    __table_args__ = (
+        UniqueConstraint(
+            "buffer_id",
+            "message_id",
+            name="telegram_media_group_buffer_members_msg_uq",
+        ),
+        UniqueConstraint(
+            "buffer_id",
+            "position",
+            name="telegram_media_group_buffer_members_position_uq",
+        ),
+        Index(
+            "telegram_media_group_buffer_members_buffer_idx",
+            "buffer_id",
+            "position",
+        ),
+    )
+
+    buffer_member_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    buffer_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("telegram_media_group_buffers.buffer_id"),
+        nullable=False,
+    )
+    message_id: Mapped[str] = mapped_column(Text, nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw_message: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class CanonicalEvent(Base):
     __tablename__ = "canonical_events"
     __table_args__ = (
@@ -316,6 +390,104 @@ class MessageMapping(Base):
     dst_chat_id: Mapped[str] = mapped_column(Text, nullable=False)
     dst_message_id: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class MessageChunk(Base):
+    __tablename__ = "message_chunks"
+    __table_args__ = (
+        UniqueConstraint(
+            "bridge_id",
+            "src_platform",
+            "src_chat_id",
+            "src_message_id",
+            name="message_chunks_src_uq",
+        ),
+        Index(
+            "message_chunks_src_idx",
+            "bridge_id",
+            "src_platform",
+            "src_chat_id",
+            "src_message_id",
+        ),
+        Index(
+            "message_chunks_dst_idx",
+            "bridge_id",
+            "dst_platform",
+            "dst_chat_id",
+            "dst_message_id",
+        ),
+    )
+
+    chunk_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    bridge_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("bridges.bridge_id"), nullable=False
+    )
+    group_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    src_platform: Mapped[Platform] = mapped_column(platform_enum, nullable=False)
+    src_chat_id: Mapped[str] = mapped_column(Text, nullable=False)
+    src_message_id: Mapped[str] = mapped_column(Text, nullable=False)
+    dst_platform: Mapped[Platform] = mapped_column(platform_enum, nullable=False)
+    dst_chat_id: Mapped[str] = mapped_column(Text, nullable=False)
+    dst_message_id: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class MessageChunkMember(Base):
+    __tablename__ = "message_chunk_members"
+    __table_args__ = (
+        CheckConstraint(
+            "member_role IN ('src','dst')",
+            name="message_chunk_members_role_ck",
+        ),
+        UniqueConstraint(
+            "chunk_id",
+            "member_role",
+            "position",
+            name="message_chunk_members_position_uq",
+        ),
+        UniqueConstraint(
+            "bridge_id",
+            "platform",
+            "chat_id",
+            "message_id",
+            name="message_chunk_members_message_uq",
+        ),
+        Index(
+            "message_chunk_members_lookup_idx",
+            "bridge_id",
+            "platform",
+            "chat_id",
+            "message_id",
+        ),
+    )
+
+    chunk_member_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    chunk_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("message_chunks.chunk_id"), nullable=False
+    )
+    bridge_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("bridges.bridge_id"), nullable=False
+    )
+    member_role: Mapped[str] = mapped_column(Text, nullable=False)
+    platform: Mapped[Platform] = mapped_column(platform_enum, nullable=False)
+    chat_id: Mapped[str] = mapped_column(Text, nullable=False)
+    message_id: Mapped[str] = mapped_column(Text, nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 

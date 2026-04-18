@@ -38,6 +38,7 @@ class FakeBot:
         self.send_message_calls: list[dict[str, object]] = []
         self.send_animation_calls: list[dict[str, object]] = []
         self.send_photo_calls: list[dict[str, object]] = []
+        self.send_media_group_calls: list[dict[str, object]] = []
         self.send_audio_calls: list[dict[str, object]] = []
         self.send_voice_calls: list[dict[str, object]] = []
         self.edit_message_caption_calls: list[dict[str, object]] = []
@@ -81,6 +82,14 @@ class FakeBot:
     async def send_photo(self, **kwargs: object) -> FakeTelegramMessage:
         self.send_photo_calls.append(dict(kwargs))
         return FakeTelegramMessage(102, "photo")
+
+    async def send_media_group(self, **kwargs: object) -> list[FakeTelegramMessage]:
+        self.send_media_group_calls.append(dict(kwargs))
+        media = cast(list[object], kwargs["media"])
+        return [
+            FakeTelegramMessage(300 + index, f"group-{index}")
+            for index, _ in enumerate(media, start=1)
+        ]
 
     async def send_audio(self, **kwargs: object) -> FakeTelegramMessage:
         self.send_audio_calls.append(dict(kwargs))
@@ -217,6 +226,41 @@ async def test_send_message_uses_caption_for_audio_media(
     assert len(call_log) == 1
     assert call_log[0]["caption"] == "🔊 Alice"
     assert result.message_id == expected_message_id
+
+
+@pytest.mark.asyncio
+async def test_send_message_uses_media_group_for_multiple_photo_video_items(
+    tmp_path: Path,
+) -> None:
+    bot = FakeBot()
+    client = make_client(bot)
+    photo_path = tmp_path / "one.jpg"
+    video_path = tmp_path / "two.mp4"
+    photo_path.write_bytes(b"jpg")
+    video_path.write_bytes(b"mp4")
+    media_items = [
+        LocalMediaFile(
+            kind=MediaKind.IMAGE,
+            path=photo_path,
+            filename="one.jpg",
+            mime_type="image/jpeg",
+        ),
+        LocalMediaFile(
+            kind=MediaKind.VIDEO,
+            path=video_path,
+            filename="two.mp4",
+            mime_type="video/mp4",
+        ),
+    ]
+
+    result = await client.send_message("-100", "Alice: album", media=media_items)
+
+    assert result.message_id == "301"
+    assert result.member_message_ids == ("301", "302")
+    assert len(bot.send_media_group_calls) == 1
+    media = cast(list[Any], bot.send_media_group_calls[0]["media"])
+    assert media[0].caption == "Alice: album"
+    assert media[1].caption is None
 
 
 @pytest.mark.asyncio

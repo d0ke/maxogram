@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from maxogram.domain import EventType, Platform, UserIdentity
+from maxogram.domain import EventType, MediaGroupKind, Platform, UserIdentity
 from maxogram.services.dedup import canonical_dedup_key, stable_json_hash
 from maxogram.services.media import build_media_plan
 from maxogram.services.rendering import sanitize_alias
@@ -49,6 +49,117 @@ def normalize_update(
     if platform == Platform.TELEGRAM:
         return _normalize_telegram(raw)
     return _normalize_max(raw)
+
+
+def normalize_telegram_media_group(
+    *,
+    group_key: str,
+    members: list[dict[str, Any]],
+    has_flushed: bool,
+) -> NormalizedUpdate | None:
+    if not members:
+        return None
+    first_message = members[0]
+    chat = _dict_value(first_message.get("chat"))
+    sender = _telegram_actor(first_message)
+    chat_id = str(chat.get("id"))
+    user_id = str(sender.get("id")) if sender.get("id") is not None else None
+    reply = first_message.get("reply_to_message")
+    reply_to_message_id = None
+    reply_to_user_id = None
+    if isinstance(reply, dict):
+        reply_message_id = reply.get("message_id")
+        reply_to_message_id = (
+            str(reply_message_id) if reply_message_id is not None else None
+        )
+        reply_sender = _telegram_actor(reply)
+        if reply_sender.get("id") is not None:
+            reply_to_user_id = str(reply_sender["id"])
+
+    caption_text: str | None = None
+    caption_entities: list[dict[str, Any]] | None = None
+    media_items: list[dict[str, Any]] = []
+    source_member_message_ids: list[str] = []
+    happened_at_values: list[int] = []
+    forwarded = False
+    for member in members:
+        media = build_media_plan(Platform.TELEGRAM, member)
+        if (
+            not media.supported
+            or media.kind not in {"image", "video"}
+            or not isinstance(media.payload, dict)
+        ):
+            return None
+        media_items.append(media.payload)
+        message_id = member.get("message_id")
+        if message_id is not None:
+            source_member_message_ids.append(str(message_id))
+        text, entities = _telegram_message_content(member)
+        if caption_text is None and text is not None:
+            caption_text = text
+            caption_entities = entities
+        forwarded = forwarded or any(key.startswith("forward_") for key in member)
+        happened_at_values.append(
+            _int_value(member.get("edit_date") or member.get("date") or 0)
+        )
+
+    happened_at = _telegram_group_happened_at(happened_at_values)
+    formatted_html = telegram_entities_to_html(caption_text, caption_entities)
+    identity = (
+        UserIdentity(
+            platform=Platform.TELEGRAM,
+            user_id=user_id,
+            username=sender.get("username"),
+            first_name=sender.get("first_name"),
+            last_name=sender.get("last_name"),
+            is_bot=sender.get("is_bot"),
+        )
+        if user_id
+        else None
+    )
+    event_type = EventType.MESSAGE_EDITED if has_flushed else EventType.MESSAGE_CREATED
+    event_version = (
+        stable_json_hash({"group_key": group_key, "members": members})
+        if event_type == EventType.MESSAGE_EDITED
+        else None
+    )
+    media_group_payload = {
+        "supported": True,
+        "group_kind": MediaGroupKind.PHOTO_VIDEO_CHUNK.value,
+        "group_key": group_key,
+        "text_hint": _photo_video_chunk_text_hint(media_items),
+        "items": media_items,
+        "source_member_message_ids": source_member_message_ids,
+    }
+    return NormalizedUpdate(
+        platform=Platform.TELEGRAM,
+        event_type=event_type,
+        dedup_key=canonical_dedup_key(
+            Platform.TELEGRAM,
+            chat_id,
+            group_key,
+            event_type,
+            event_version,
+        ),
+        chat_id=chat_id,
+        user_id=user_id,
+        message_id=group_key,
+        event_version=event_version,
+        text=caption_text,
+        formatted_html=formatted_html,
+        happened_at=happened_at,
+        identity=identity,
+        reply_to_message_id=reply_to_message_id,
+        reply_to_user_id=reply_to_user_id,
+        forwarded=forwarded,
+        media_hint=media_group_payload["text_hint"],
+        payload={
+            "raw_messages": members,
+            "media_group": media_group_payload,
+        },
+        is_command=False,
+        is_bot_message=bool(sender.get("is_bot")),
+    )
 
 
 def _normalize_telegram(raw: dict[str, Any]) -> NormalizedUpdate | None:
@@ -219,6 +330,11 @@ def _normalize_max(raw: dict[str, Any]) -> NormalizedUpdate | None:
         or 0
     )
     happened_at = _max_datetime(timestamp)
+    media_group = _max_photo_video_chunk_payload(
+        content_message,
+        chat_id=chat_id,
+        message_id=message_id,
+    )
     media = build_media_plan(Platform.MAX, content_message)
     text = _string_value(content_body.get("text"))
     markup_value = content_body.get("markup")
@@ -266,8 +382,16 @@ def _normalize_max(raw: dict[str, Any]) -> NormalizedUpdate | None:
         identity=identity,
         reply_to_message_id=str(reply_mid) if reply_mid is not None else None,
         forwarded=link.get("type") == "forward",
-        media_hint=media.text_hint,
-        payload={"raw_message": content_message, "media": asdict(media)},
+        media_hint=(
+            str(media_group.get("text_hint"))
+            if isinstance(media_group, dict)
+            else media.text_hint
+        ),
+        payload=(
+            {"raw_message": content_message, "media_group": media_group}
+            if isinstance(media_group, dict)
+            else {"raw_message": content_message, "media": asdict(media)}
+        ),
         is_command=bool(
             isinstance(text, str)
             and text.startswith("/")
@@ -287,6 +411,13 @@ def _max_datetime(value: object) -> datetime:
     if number <= 0:
         return datetime.now(UTC)
     return datetime.fromtimestamp(number, tz=UTC)
+
+
+def _telegram_group_happened_at(values: list[int]) -> datetime:
+    timestamp = max(values) if values else 0
+    if timestamp <= 0:
+        return datetime.now(UTC)
+    return datetime.fromtimestamp(timestamp, tz=UTC)
 
 
 def _dict_value(value: object) -> dict[str, Any]:
@@ -359,6 +490,54 @@ def _max_forward_source_is_bot(link: dict[str, Any]) -> bool:
         return True
     username = _string_value(sender.get("username"))
     return bool(username and username.lower().endswith("bot"))
+
+
+def _max_photo_video_chunk_payload(
+    message: dict[str, Any],
+    *,
+    chat_id: str,
+    message_id: str,
+) -> dict[str, Any] | None:
+    body = message.get("body") if isinstance(message.get("body"), dict) else message
+    attachments = body.get("attachments") if isinstance(body, dict) else None
+    if not isinstance(attachments, list) or len(attachments) < 2:
+        return None
+
+    media_items: list[dict[str, Any]] = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            return None
+        media = build_media_plan(
+            Platform.MAX,
+            {"body": {"attachments": [attachment]}},
+        )
+        if (
+            not media.supported
+            or media.kind not in {"image", "video"}
+            or not isinstance(media.payload, dict)
+        ):
+            return None
+        media_items.append(media.payload)
+
+    if len(media_items) < 2:
+        return None
+    return {
+        "supported": True,
+        "group_kind": MediaGroupKind.PHOTO_VIDEO_CHUNK.value,
+        "group_key": f"{Platform.MAX.value}:{chat_id}:{message_id}",
+        "text_hint": _photo_video_chunk_text_hint(media_items),
+        "items": media_items,
+        "source_member_message_ids": [message_id],
+    }
+
+
+def _photo_video_chunk_text_hint(media_items: list[dict[str, Any]]) -> str:
+    kinds = {str(item.get("kind")) for item in media_items}
+    if kinds == {"image"}:
+        return "[photo group]"
+    if kinds == {"video"}:
+        return "[video group]"
+    return "[photo/video group]"
 
 
 def _unwrap_bridge_text(text: str | None) -> _UnwrappedBridgeText | None:

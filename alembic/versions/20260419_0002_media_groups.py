@@ -4,12 +4,18 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-from maxogram.db.models import platform_enum
-
 revision = "20260419_0002"
 down_revision = "20260410_0001"
 branch_labels = None
 depends_on = None
+
+
+platform_enum = postgresql.ENUM(
+    "telegram",
+    "max",
+    name="platform",
+    create_type=False,
+)
 
 
 def upgrade() -> None:

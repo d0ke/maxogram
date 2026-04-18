@@ -7,7 +7,7 @@ Production deployment is Docker-first:
 - the application runs from the public image `docker.io/d0ke/maxogram:latest`
 - the published runtime image is based on Python `3.12`
 - PostgreSQL stays on the VPS host or on a remote server
-- `install.sh` manages PostgreSQL discovery/provisioning plus Docker Compose deployment
+- `install.sh` gives you a one-line installer
 
 ## What It Supports
 
@@ -17,18 +17,17 @@ Production deployment is Docker-first:
 - Reply mapping in both directions, including replies to already mirrored messages.
 - Message edit and delete synchronization when the source platform exposes the event.
 - Rich-text preservation for supported Telegram and MAX formatting, including underline.
-- Real media relay for common attachment types such as photos, videos, GIF-style animations, documents, audio, voice messages, and stickers.
+- Real media relay for common attachment types such as photos, videos, documents, audio, and voice messages.
+- Sticker and animation support for static stickers, Telegram animated stickers, video stickers, and GIF-style animations.
 - Recovery flows backed by PostgreSQL queues, message mappings, and pending-mutation replay.
 
-## Official Production Artifact
+## Production Setup
 
 - Docker image: `docker.io/d0ke/maxogram:latest`
 - Installer-managed env file: `/etc/maxogram/maxogram.env`
 - Installer-managed compose file: `/opt/maxogram/docker-compose.app.yml`
 
 ## One-Line Install
-
-These commands download the installer to `/tmp` first and then run it locally, so interactive prompts work reliably.
 
 ### Auto Mode
 
@@ -117,6 +116,32 @@ The installer does not:
 - drop existing Maxogram PostgreSQL data
 - require `git` on the server
 - require Python on the server
+
+## Storage and Privacy
+
+Maxogram is self-hosted, so the bridge data it needs lives in your PostgreSQL database, while temporary relay files stay on local disk only for as long as the runtime needs them.
+
+In PostgreSQL, Maxogram stores:
+
+- `raw updates`: the original Telegram or MAX update JSON received by the bot, including message text or caption, sender and chat identifiers, reply or forward structure, and attachment references or platform file IDs
+- `normalized payloads`: Maxogram's cleaned relay-ready representation of those updates, including extracted text or caption, supported formatting, sender and reply metadata, and media metadata used for mirroring and retries
+- source and destination message-id mappings so replies, edits, and deletes can be mirrored later
+- delivery and retry state such as outbox tasks, pending mutations, delivery attempts, and dead letters
+- bridge and user metadata such as aliases, alias history, cached platform identity fields, bridge admins, and command log entries
+- short-lived bridge link codes
+
+Maxogram does not use PostgreSQL as a durable media store:
+
+- photo, video, audio, and document file bytes are not persisted in PostgreSQL
+- ordinary downloaded media files go to `temp/media_cache` only while they are being relayed and are deleted after use
+- converted Telegram animated stickers are cached as GIF files under `temp/animated_sticker_cache` and can remain for up to 90 days since last use before cleanup
+- the reserved `media_objects` table exists in the schema but is not currently used by the live runtime media flow
+
+Retention notes:
+
+- bridge link codes expire after about 3 minutes
+- pending edit and delete replay entries also expire after about 3 minutes if a destination mapping never appears
+- there is currently no built-in automatic cleanup for stored raw updates, normalized events, message mappings, command logs, or delivery history, so those remain in PostgreSQL until you clean or rotate the database yourself
 
 ## Manual Docker Deployment
 

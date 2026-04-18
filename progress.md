@@ -17,6 +17,7 @@
 - Moved the supported runtime baseline from Python `3.13` to Python `3.12` by changing the production `Dockerfile` base image and tightening package metadata in `pyproject.toml` to `>=3.12,<3.13`.
 - Updated Ruff and mypy configuration targets to Python `3.12` so local static analysis matches the supported runtime.
 - Updated `README.md` to state that both production and local development now target Python `3.12`, and that existing Python `3.13` virtual environments are unsupported and should be recreated.
+- Reworked `README.md` copy to be more user-friendly by simplifying the installer description, renaming the production setup section, clarifying sticker and animation support, removing extra installer wording, and adding a direct `Storage and Privacy` section that explains what PostgreSQL stores, what stays temporary on disk, and which retention rules exist today.
 - Kept the animated sticker `.tgs -> GIF` path unchanged and treated this as a runtime compatibility fix for `pyrlottie` and its `numpy<2` dependency chain rather than a converter refactor.
 
 ## 2026-04-16

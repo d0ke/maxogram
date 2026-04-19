@@ -15,6 +15,7 @@ from maxogram.db.session import Database
 from maxogram.domain import OutboxAction, Platform, TaskStatus
 from maxogram.metrics import dlq_total, retry_total
 from maxogram.platforms.base import PlatformClient, PlatformDeliveryError
+from maxogram.services.dedup import stable_json_hash
 from maxogram.runtime_resilience import (
     RuntimeBackoffState,
     is_retryable_worker_error,
@@ -345,13 +346,23 @@ class DeliveryWorker:
     ) -> EditMode:
         if action != OutboxAction.EDIT:
             return EditMode.TEXT_ONLY
-        if _is_media_group_payload(payload):
-            return EditMode.REPLACE_MEDIA_GROUP
-        current_media = _optional_dict(payload.get("media"))
         src = _expect_dict(payload.get("src"), "src")
+        dst = _expect_dict(payload.get("dst"), "dst")
         src_platform = _parse_platform(src.get("platform"), "src.platform")
+        dst_platform = _parse_platform(dst.get("platform"), "dst.platform")
         src_chat_id = _optional_str(src.get("chat_id"))
         src_message_id = _optional_str(src.get("message_id"))
+        if _is_media_group_payload(payload):
+            return await self._classify_media_group_edit_mode(
+                repo=repo,
+                bridge_id=bridge_id,
+                payload=payload,
+                src_platform=src_platform,
+                src_chat_id=src_chat_id,
+                src_message_id=src_message_id,
+                dst_platform=dst_platform,
+            )
+        current_media = _optional_dict(payload.get("media"))
         if src_chat_id is None or src_message_id is None:
             return EditMode.TEXT_ONLY
         created_payload = await repo.get_created_event_payload(
@@ -394,6 +405,57 @@ class DeliveryWorker:
             mode,
             current_identity=current_identity,
             created_identity=created_identity,
+        )
+
+    async def _classify_media_group_edit_mode(
+        self,
+        *,
+        repo: Repository,
+        bridge_id: uuid.UUID,
+        payload: dict[str, Any],
+        src_platform: Platform,
+        src_chat_id: str | None,
+        src_message_id: str | None,
+        dst_platform: Platform,
+    ) -> EditMode:
+        current_group_signature = _payload_media_group_signature(payload)
+        if dst_platform != Platform.TELEGRAM:
+            return self._log_edit_mode(
+                payload,
+                EditMode.REPLACE_MEDIA_GROUP,
+                current_identity=current_group_signature,
+                created_identity=None,
+            )
+        if src_chat_id is None or src_message_id is None:
+            return self._log_edit_mode(
+                payload,
+                EditMode.REPLACE_MEDIA_GROUP,
+                current_identity=current_group_signature,
+                created_identity=None,
+            )
+        created_payload = await repo.get_created_event_payload(
+            bridge_id,
+            src_platform,
+            src_chat_id,
+            src_message_id,
+        )
+        created_group_signature = _payload_media_group_signature(created_payload)
+        current_group_identities = _payload_media_group_identities(payload)
+        created_group_identities = _payload_media_group_identities(created_payload)
+        mode = (
+            EditMode.CAPTION_ONLY_SAME_MEDIA
+            if (
+                current_group_identities is not None
+                and created_group_identities is not None
+                and current_group_identities == created_group_identities
+            )
+            else EditMode.REPLACE_MEDIA_GROUP
+        )
+        return self._log_edit_mode(
+            payload,
+            mode,
+            current_identity=current_group_signature,
+            created_identity=created_group_signature,
         )
 
     def _log_edit_mode(
@@ -817,6 +879,59 @@ def _payload_media_identity(
         media,
         raw_message=_payload_raw_message(payload),
     )
+
+
+def _payload_media_group_identities(
+    payload: dict[str, Any] | None,
+) -> list[str] | None:
+    if _payload_media_group_kind(payload) != "photo_video_chunk":
+        return None
+    identities: list[str] = []
+    for media_item in _payload_media_group_items(payload):
+        identity = resolve_media_identity(media_item)
+        if identity is None:
+            return None
+        identities.append(identity)
+    return identities if identities else None
+
+
+def _payload_media_group_signature(
+    payload: dict[str, Any] | None,
+) -> str | None:
+    identities = _payload_media_group_identities(payload)
+    if identities is None:
+        return None
+    return stable_json_hash(identities)
+
+
+def _payload_media_group_kind(payload: dict[str, Any] | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    group_kind = payload.get("group_kind")
+    if isinstance(group_kind, str) and group_kind:
+        return group_kind
+    media_group = _optional_dict(payload.get("media_group"))
+    if media_group is None:
+        return None
+    nested_group_kind = media_group.get("group_kind")
+    if isinstance(nested_group_kind, str) and nested_group_kind:
+        return nested_group_kind
+    return None
+
+
+def _payload_media_group_items(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    direct_items = payload.get("media_items")
+    if isinstance(direct_items, list):
+        return [item for item in direct_items if isinstance(item, dict)]
+    media_group = _optional_dict(payload.get("media_group"))
+    if media_group is None:
+        return []
+    nested_items = media_group.get("items")
+    if not isinstance(nested_items, list):
+        return []
+    return [item for item in nested_items if isinstance(item, dict)]
 
 
 def _parse_platform(value: object, field_name: str) -> Platform:

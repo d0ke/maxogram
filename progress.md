@@ -35,6 +35,9 @@
 - Fixed Telegram media-group buffer resequencing so one transaction can ingest multiple album members safely with `autoflush=False`, avoiding the repeated `telegram_media_group_buffer_members_position_uq` crash that had blocked all later normalizer work.
 - Changed Telegram album member ordering to canonical message-id order instead of first-arrival order, so out-of-order Telegram updates still flush into one stable ordered chunk.
 - Added regression coverage for out-of-order Telegram album arrival in the normalizer tests and an optional Postgres-backed repository test that commits one whole media group in a single async session without hitting the former unique-constraint failure.
+- Optimized the narrow `MAX -> Telegram` grouped edit case where only the caption changes and the ordered media identities still match the original `message.created` chunk, so the bridge now edits the first mirrored Telegram album caption in place instead of deleting and recreating the whole album.
+- Kept the conservative grouped-edit fallback for any media change, missing created-state comparison data, identity mismatch, or non-Telegram destination, so all uncertain grouped edits still use the existing delete-and-recreate path.
+- Added delivery regressions for grouped caption-only Telegram edits, grouped edit-mode classification against created-state media identities, and the conservative recreate fallback when grouped media differ or created-state payloads are unavailable.
 
 ## 2026-04-16
 

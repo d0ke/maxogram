@@ -1791,6 +1791,66 @@ async def test_delivery_recreates_telegram_media_group_on_group_edit(
 
 
 @pytest.mark.asyncio
+async def test_delivery_edits_max_group_caption_on_telegram_without_recreating_album(
+    tmp_path: Path,
+):
+    telegram_bot = DeliveryTelegramBot()
+    telegram = object.__new__(TelegramClient)
+    telegram.bot = cast(Any, telegram_bot)
+    max_client = FakeClient("max")
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: cast(Any, telegram),
+            Platform.MAX: max_client,
+        },
+    )
+    context = make_context(
+        action="edit",
+        bridge_id=uuid.uuid4(),
+        dst_platform=Platform.TELEGRAM,
+        task_payload={
+            "src": {"platform": "max", "chat_id": "300", "message_id": "mid-group"},
+            "dst": {"platform": "telegram", "chat_id": "-100"},
+            "dst_message_id": "55",
+            "dst_message_ids": ["55", "56"],
+            "text": "Alice: updated album",
+            "has_media": True,
+            "media": None,
+            "group_kind": "photo_video_chunk",
+            "group_key": "max:300:mid-group",
+            "media_items": [
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-1",
+                    filename="one.jpg",
+                    mime_type="image/jpeg",
+                ),
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-2",
+                    filename="two.jpg",
+                    mime_type="image/jpeg",
+                ),
+            ],
+        },
+        edit_mode=EditMode.CAPTION_ONLY_SAME_MEDIA,
+    )
+
+    await worker._call_platform(context)
+
+    assert len(telegram_bot.edit_message_caption_calls) == 1
+    assert telegram_bot.edit_message_caption_calls[0]["message_id"] == 55
+    assert telegram_bot.edit_message_caption_calls[0]["caption"] == "Alice: updated album"
+    assert telegram_bot.edit_message_media_calls == []
+    assert telegram_bot.send_photo_calls == []
+    assert telegram_bot.send_animation_calls == []
+    assert telegram_bot.send_message_calls == []
+
+
+@pytest.mark.asyncio
 async def test_delivery_replaces_max_media_group_with_full_attachment_array(
     tmp_path: Path,
 ):
@@ -2004,6 +2064,167 @@ async def test_classify_edit_mode_detects_max_photo_replacement(tmp_path: Path):
     )
 
     assert mode == EditMode.REPLACE_MEDIA
+
+
+@pytest.mark.asyncio
+async def test_classify_edit_mode_keeps_same_max_group_as_caption_only(tmp_path: Path):
+    bridge_id = uuid.uuid4()
+    state = DeliveryState(tasks={})
+    repo = FakeRepository(FakeSession(state))
+    telegram = FakeClient("telegram")
+    max_client = FakeClient("max")
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+    )
+    state.created_payloads[(bridge_id, Platform.MAX, "300", "mid-group")] = {
+        "media_group": {
+            "group_kind": "photo_video_chunk",
+            "items": [
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-1",
+                ),
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="video",
+                    identity="max:video:id:video-2",
+                ),
+            ],
+        },
+    }
+
+    mode = await worker._classify_edit_mode(
+        repo=cast(Any, repo),
+        bridge_id=bridge_id,
+        payload={
+            "src": {"platform": "max", "chat_id": "300", "message_id": "mid-group"},
+            "dst": {"platform": "telegram", "chat_id": "-100"},
+            "group_kind": "photo_video_chunk",
+            "media_items": [
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-1",
+                ),
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="video",
+                    identity="max:video:id:video-2",
+                ),
+            ],
+        },
+        action=OutboxAction.EDIT,
+    )
+
+    assert mode == EditMode.CAPTION_ONLY_SAME_MEDIA
+
+
+@pytest.mark.asyncio
+async def test_classify_edit_mode_recreates_max_group_when_any_item_changes(
+    tmp_path: Path,
+):
+    bridge_id = uuid.uuid4()
+    state = DeliveryState(tasks={})
+    repo = FakeRepository(FakeSession(state))
+    telegram = FakeClient("telegram")
+    max_client = FakeClient("max")
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+    )
+    state.created_payloads[(bridge_id, Platform.MAX, "300", "mid-group")] = {
+        "media_group": {
+            "group_kind": "photo_video_chunk",
+            "items": [
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-1",
+                ),
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="video",
+                    identity="max:video:id:video-2",
+                ),
+            ],
+        },
+    }
+
+    mode = await worker._classify_edit_mode(
+        repo=cast(Any, repo),
+        bridge_id=bridge_id,
+        payload={
+            "src": {"platform": "max", "chat_id": "300", "message_id": "mid-group"},
+            "dst": {"platform": "telegram", "chat_id": "-100"},
+            "group_kind": "photo_video_chunk",
+            "media_items": [
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-1",
+                ),
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="video",
+                    identity="max:video:id:video-3",
+                ),
+            ],
+        },
+        action=OutboxAction.EDIT,
+    )
+
+    assert mode == EditMode.REPLACE_MEDIA_GROUP
+
+
+@pytest.mark.asyncio
+async def test_classify_edit_mode_recreates_max_group_when_created_payload_is_missing(
+    tmp_path: Path,
+):
+    bridge_id = uuid.uuid4()
+    state = DeliveryState(tasks={})
+    repo = FakeRepository(FakeSession(state))
+    telegram = FakeClient("telegram")
+    max_client = FakeClient("max")
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+    )
+
+    mode = await worker._classify_edit_mode(
+        repo=cast(Any, repo),
+        bridge_id=bridge_id,
+        payload={
+            "src": {"platform": "max", "chat_id": "300", "message_id": "mid-group"},
+            "dst": {"platform": "telegram", "chat_id": "-100"},
+            "group_kind": "photo_video_chunk",
+            "media_items": [
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-1",
+                ),
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="video",
+                    identity="max:video:id:video-2",
+                ),
+            ],
+        },
+        action=OutboxAction.EDIT,
+    )
+
+    assert mode == EditMode.REPLACE_MEDIA_GROUP
 
 
 @pytest.mark.asyncio

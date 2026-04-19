@@ -74,7 +74,7 @@ Main runtime areas:
 - `src/maxogram/platforms`: Telegram and MAX client adapters
 - `src/maxogram/services`: normalization, rendering, media planning, commands, formatting, retries
 - `src/maxogram/workers`: pollers, normalizer, delivery, reconciliation
-- `alembic`: schema bootstrap migration
+- `alembic`: baseline and incremental schema migrations
 
 ### Process Model
 
@@ -125,11 +125,13 @@ Telegram polling:
 - uses `getUpdates`
 - requests `message`, `edited_message`, `chat_member`, and `my_chat_member`
 - safely serializes update objects before writing them into PostgreSQL
+- persists Telegram album members individually; grouping happens later in normalization rather than inside the poller
 
 MAX polling:
 
 - uses long polling with explicit update types
 - uses `update_id` or a stable raw-update hash as the inbox dedup key
+- persists multi-attachment messages as one raw update, which later lets normalization build one logical grouped event
 
 ### Normalization and Bridge Resolution
 
@@ -139,12 +141,17 @@ The normalizer claims `inbox_updates` rows with `FOR UPDATE SKIP LOCKED`, conver
 - a canonical relay event
 - an ignored row
 
+For grouped Telegram `photo/video` albums it first buffers member messages in `telegram_media_group_buffers` and `telegram_media_group_buffer_members`, keyed by `telegram:<chat_id>:<media_group_id>`, and flushes them after a short quiet window so one album becomes one canonical chunk event.
+
 For relayable messages it resolves:
 
 - the bridge and destination chat
 - sender identity and alias
 - reply mapping when available
 - rendered text, HTML text, fallback text, and media metadata
+- grouped-media metadata such as `group_kind`, stable `group_key`, ordered `media_items`, and source member ids when a payload represents a logical chunk
+
+MAX messages that contain multiple supported `image` or `video` attachments normalize into one logical `photo_video_chunk` event with chunk-scoped caption handling instead of multiple unrelated relay events.
 
 It then inserts a deduplicated row into `canonical_events` and enqueues work in `outbox_tasks` or `pending_mutations`.
 
@@ -152,7 +159,15 @@ It then inserts a deduplicated row into `canonical_events` and enqueues work in 
 
 The delivery worker claims `outbox_tasks`, performs network I/O outside the original claim transaction, and finalizes success or failure in a fresh transaction.
 
-Successful sends create `message_mappings`, which later power:
+Successful sends always persist the actual emitted destination shape. For ordinary messages this means a `message_mappings` row. For grouped `photo/video` chunks it can also mean:
+
+- a `message_chunks` row for the logical source-to-destination chunk
+- `message_chunk_members` rows for ordered source and destination member ids
+- enriched `outbox_tasks.task` JSON that records `dst_message_id`, optional `dst_message_ids`, and a `delivery_state` snapshot used by later edit/delete classification
+
+When a grouped payload is too large for one downstream request, delivery can split it into multiple ordered destination messages and, on `MAX -> Telegram`, emit bracketed oversize hint stubs for filtered items.
+
+These mappings later power:
 
 - native reply targets
 - edit mirroring
@@ -163,7 +178,7 @@ Successful sends create `message_mappings`, which later power:
 The reconciliation worker:
 
 - resets expired in-flight outbox rows
-- replays `pending_mutations` after mappings appear
+- replays `pending_mutations` after the needed mappings appear
 - expires unrecoverable pending mutations into `dead_letters`
 - prunes converted animated-sticker GIF cache entries not used for more than 90 days
 
@@ -173,7 +188,12 @@ The reconciliation worker:
 
 PostgreSQL is the only durable store. There is no external queue, cache, or broker.
 
-The repository currently has one Alembic revision, `20260410_0001`, whose `upgrade()` calls `Base.metadata.create_all(...)` and whose `downgrade()` calls `Base.metadata.drop_all(...)`.
+The repository currently has two Alembic revisions:
+
+- `20260410_0001`: baseline schema bootstrap whose `upgrade()` calls `Base.metadata.create_all(...)` and whose `downgrade()` calls `Base.metadata.drop_all(...)`
+- `20260419_0002`: incremental migration that adds persistent Telegram media-group buffering tables plus logical chunk/member mapping tables for grouped photo/video sync
+
+The live schema therefore includes both the baseline relay tables and the grouped-media persistence tables when a database is upgraded to head.
 
 The installer can place tables in a non-public PostgreSQL schema by:
 
@@ -363,6 +383,49 @@ Notes:
 - unique constraint on `(platform, bot_id, update_key)`
 - indexed by `(status, received_at)` for worker claims
 
+#### `telegram_media_group_buffers`
+
+Purpose: durable short-lived buffer state for Telegram media groups that need to be aggregated into one logical chunk before canonicalization.
+
+Columns:
+
+- `buffer_id`: UUID primary key for the open buffer row.
+- `group_key`: stable logical group key, currently `telegram:<chat_id>:<media_group_id>`.
+- `chat_id`: Telegram chat id for the album.
+- `media_group_id`: raw Telegram media-group identifier.
+- `anchor_message_id`: optional anchor message id for the buffered album.
+- `pending_flush`: whether the buffer is still waiting to be flushed by the normalizer.
+- `has_flushed`: whether the buffer has already been converted into a canonical chunk event.
+- `flush_after`: timestamp after which the normalizer may flush the group.
+- `created_at`: creation timestamp.
+- `updated_at`: last update timestamp.
+
+Notes:
+
+- unique constraint on `group_key`
+- indexed by `(pending_flush, flush_after)` so the normalizer can claim ready groups efficiently
+
+#### `telegram_media_group_buffer_members`
+
+Purpose: ordered raw Telegram album members attached to one open media-group buffer.
+
+Columns:
+
+- `buffer_member_id`: UUID primary key.
+- `buffer_id`: foreign key to `telegram_media_group_buffers.buffer_id`.
+- `message_id`: Telegram message id for the buffered member.
+- `position`: current member position inside the buffered group.
+- `raw_message`: JSONB raw Telegram message payload for the member.
+- `created_at`: creation timestamp.
+- `updated_at`: last update timestamp.
+
+Notes:
+
+- unique constraint on `(buffer_id, message_id)`
+- unique constraint on `(buffer_id, position)`
+- indexed by `(buffer_id, position)` for ordered flush reads
+- repository logic resequences members into canonical message-id order before flush
+
 #### `canonical_events`
 
 Purpose: normalized source-of-truth relay events derived from raw inbox updates.
@@ -408,6 +471,54 @@ Notes:
 - unique constraint for the source side of a mapping
 - unique constraint for the destination side of a mapping
 - used for replies, edits, deletes, and replay of pending mutations
+
+#### `message_chunks`
+
+Purpose: logical mapping for grouped relay events where one normalized chunk may correspond to multiple source or destination member message ids.
+
+Columns:
+
+- `chunk_id`: UUID primary key for the logical chunk row.
+- `bridge_id`: foreign key to `bridges.bridge_id`.
+- `group_kind`: logical chunk type, currently used for grouped `photo/video` relay.
+- `src_platform`: source platform enum.
+- `src_chat_id`: source chat id.
+- `src_message_id`: logical source message id for the chunk.
+- `dst_platform`: destination platform enum.
+- `dst_chat_id`: destination chat id.
+- `dst_message_id`: primary destination message id for the chunk.
+- `created_at`: creation timestamp.
+- `updated_at`: last update timestamp.
+
+Notes:
+
+- unique constraint on `(bridge_id, src_platform, src_chat_id, src_message_id)`
+- indexed for both source-side and destination-side chunk lookup
+- complements `message_mappings` when the runtime needs one logical grouped mapping plus ordered member lookups
+
+#### `message_chunk_members`
+
+Purpose: ordered source-side and destination-side member ids that belong to a logical chunk mapping.
+
+Columns:
+
+- `chunk_member_id`: UUID primary key.
+- `chunk_id`: foreign key to `message_chunks.chunk_id`.
+- `bridge_id`: foreign key to `bridges.bridge_id`.
+- `member_role`: constrained text value, either `src` or `dst`.
+- `platform`: platform enum for the stored member id.
+- `chat_id`: chat id for the stored member id.
+- `message_id`: concrete member message id.
+- `position`: ordered position within the logical chunk.
+- `created_at`: creation timestamp.
+- `updated_at`: last update timestamp.
+
+Notes:
+
+- check constraint limiting `member_role` to `src` or `dst`
+- unique constraint on `(chunk_id, member_role, position)`
+- unique constraint on `(bridge_id, platform, chat_id, message_id)` for reverse lookup by any chunk member
+- indexed by `(bridge_id, platform, chat_id, message_id)` for reply/edit/delete resolution
 
 #### `pending_mutations`
 
@@ -459,6 +570,7 @@ Notes:
 - unique constraint on `dedup_key`
 - unique constraint on `(partition_key, seq)`
 - indexed for ready-task lookup and ordered partition scans
+- successful sends may persist `dst_message_id`, ordered `dst_message_ids`, and a `delivery_state` snapshot back into `task` JSON so later mutations can see the actual emitted delivery shape
 
 #### `delivery_attempts`
 
@@ -559,10 +671,13 @@ Notes:
 The queueing and deduplication model relies on concrete database conventions:
 
 - `inbox_updates` deduplicates raw updates by `(platform, bot_id, update_key)`
+- `telegram_media_group_buffers` hold open Telegram albums until a quiet-window flush creates one canonical chunk event
 - `canonical_events` deduplicates normalized events by `dedup_key`
 - `outbox_tasks` deduplicates destination actions by `dedup_key`
 - `message_mappings` supports lookups from both source ids and destination ids
+- `message_chunks` and `message_chunk_members` map logical grouped messages to their ordered source and destination member ids
 - `pending_mutations` holds edits and deletes until mappings exist
+- successful `outbox_tasks.task` payloads may record `delivery_state` plus emitted destination ids for later mutation decisions
 
 Outbox ordering is enforced by:
 
@@ -629,6 +744,12 @@ MAX-origin media currently supports:
 - audio
 - stickers as images
 
+Grouped photo/video chunk behavior currently includes:
+
+- Telegram albums are aggregated into one logical `photo_video_chunk` event before delivery
+- `Telegram -> MAX` grouped sends and edits use one MAX message with the full ordered attachment array
+- `MAX -> Telegram` grouped sends use native Telegram media groups, can split oversized chunks into multiple ordered destination messages, keep the caption on the first emitted media piece, and add bracketed oversize hint stubs when individual items are filtered out
+
 ### Edits and Deletes
 
 Implemented mutation behavior:
@@ -637,6 +758,9 @@ Implemented mutation behavior:
 - MAX edited messages become distinct edit events
 - MAX top-level `message_removed` updates become delete events
 - edits and deletes replay later if they arrived before a destination mapping existed
+- grouped deletes use chunk/member mappings so the runtime can remove the whole mirrored chunk rather than only one member
+- grouped `MAX -> Telegram` edits use an in-place caption edit only for the narrow safe case where the mirrored Telegram delivery was a single-piece album with matching media identities; other grouped edits fall back to delete-and-recreate
+- single-media text fallbacks and split grouped deliveries are classified from persisted `delivery_state` snapshots before later edits are applied
 
 Known limitation:
 

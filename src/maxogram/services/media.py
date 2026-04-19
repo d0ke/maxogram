@@ -6,11 +6,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from maxogram.domain import MediaKind, MediaPresentation, Platform
+from maxogram.domain import LocalMediaFile, MediaKind, MediaPresentation, Platform
 from maxogram.metrics import telegram_media_oversize_total
 from maxogram.services.dedup import stable_json_hash
 
 TELEGRAM_DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
+TELEGRAM_UPLOAD_PHOTO_LIMIT_BYTES = 10 * 1024 * 1024
+TELEGRAM_UPLOAD_FILE_LIMIT_BYTES = 50 * 1024 * 1024
+MAX_UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024
+OUTBOUND_MEDIA_COUNT_LIMIT = 10
+OUTBOUND_MEDIA_PIECE_BUDGET_BYTES = 48 * 1024 * 1024
 VIDEO_URL_ORDER = (
     "mp4_1080",
     "mp4_720",
@@ -248,6 +253,7 @@ def _max_media_plan(message: dict[str, Any]) -> MediaPlan:
                 presentation=MediaPresentation.ANIMATION if is_gif else None,
             ),
             presentation=MediaPresentation.ANIMATION if is_gif else None,
+            size=file_size,
             extra_source={"photo_id": photo_id} if photo_id else None,
         )
     if raw_type == "video":
@@ -265,6 +271,7 @@ def _max_media_plan(message: dict[str, Any]) -> MediaPlan:
                 filename=filename,
                 mime_type=mime_type or "video/mp4",
             ),
+            size=file_size,
             extra_source={
                 "video_urls": raw_urls,
                 "thumbnail_url": _string_value(thumbnail.get("url")),
@@ -566,4 +573,49 @@ def _is_oversize_telegram(size: int | None) -> bool:
 def _telegram_oversize_hint(kind: MediaKind) -> str:
     return (
         f"[{kind.value} unavailable: exceeds Telegram bot 20 MB download limit]"
+    )
+
+
+def destination_media_upload_limit_bytes(
+    platform: Platform,
+    media: LocalMediaFile,
+) -> int:
+    return destination_upload_limit_bytes(
+        platform,
+        media.kind,
+        presentation=media.presentation,
+    )
+
+
+def destination_upload_limit_bytes(
+    platform: Platform,
+    kind: MediaKind,
+    *,
+    presentation: MediaPresentation | None = None,
+) -> int:
+    if platform == Platform.TELEGRAM:
+        if presentation == MediaPresentation.ANIMATION:
+            return TELEGRAM_UPLOAD_FILE_LIMIT_BYTES
+        if kind == MediaKind.IMAGE:
+            return TELEGRAM_UPLOAD_PHOTO_LIMIT_BYTES
+        return TELEGRAM_UPLOAD_FILE_LIMIT_BYTES
+    return MAX_UPLOAD_LIMIT_BYTES
+
+
+def destination_upload_oversize_hint(
+    platform: Platform,
+    kind: MediaKind,
+    *,
+    presentation: MediaPresentation | None = None,
+) -> str:
+    limit_bytes = destination_upload_limit_bytes(
+        platform,
+        kind,
+        presentation=presentation,
+    )
+    platform_name = "Telegram" if platform == Platform.TELEGRAM else "MAX"
+    limit_mb = limit_bytes // (1024 * 1024)
+    return (
+        f"[{kind.value} unavailable: exceeds {platform_name} "
+        f"{limit_mb} MB upload limit]"
     )

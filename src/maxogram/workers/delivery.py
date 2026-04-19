@@ -12,7 +12,7 @@ from typing import Any
 from maxogram.db.models import OutboxTask
 from maxogram.db.repositories import Repository
 from maxogram.db.session import Database
-from maxogram.domain import OutboxAction, Platform, TaskStatus
+from maxogram.domain import LocalMediaFile, OutboxAction, Platform, TaskStatus
 from maxogram.metrics import dlq_total, retry_total
 from maxogram.platforms.base import PlatformClient, PlatformDeliveryError
 from maxogram.services.dedup import stable_json_hash
@@ -21,7 +21,13 @@ from maxogram.runtime_resilience import (
     is_retryable_worker_error,
     wait_or_stop,
 )
-from maxogram.services.media import resolve_media_identity
+from maxogram.services.media import (
+    OUTBOUND_MEDIA_COUNT_LIMIT,
+    OUTBOUND_MEDIA_PIECE_BUDGET_BYTES,
+    destination_media_upload_limit_bytes,
+    destination_upload_oversize_hint,
+    resolve_media_identity,
+)
 from maxogram.services.relay import cleanup_local_media, materialize_media
 from maxogram.services.retry import retry_decision
 
@@ -33,6 +39,14 @@ class EditMode(StrEnum):
     CAPTION_ONLY_SAME_MEDIA = "caption_only_same_media"
     REPLACE_MEDIA = "replace_media"
     REPLACE_MEDIA_GROUP = "replace_media_group"
+
+
+class DeliveryShape(StrEnum):
+    TEXT = "text"
+    SINGLE_MEDIA = "single_media"
+    GROUP_SINGLE_PIECE = "group_single_piece"
+    GROUP_MULTI_PIECE = "group_multi_piece"
+    GROUP_FALLBACK_ONLY = "group_fallback_only"
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +72,39 @@ class DeliveryResult:
     dst_message_id: str | None = None
     dst_message_ids: tuple[str, ...] = ()
     sent_with_media: bool = False
+    delivery_state: DeliveryStateSnapshot | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryStateSnapshot:
+    shape: DeliveryShape
+    media_filtered: bool
+    emitted_message_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MaterializedMediaItem:
+    local_file: LocalMediaFile
+    byte_size: int
+    upload_limit_bytes: int
+    oversize_hint: str
+
+
+@dataclass(frozen=True, slots=True)
+class MediaPiece:
+    items: tuple[MaterializedMediaItem, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class HintPiece:
+    text_plain: str
+
+
+@dataclass(frozen=True, slots=True)
+class PlannedDeliveryPieces:
+    pieces: tuple[MediaPiece | HintPiece, ...]
+    source_is_group: bool
+    media_filtered: bool
 
 
 class DeliveryWorker:
@@ -207,7 +254,12 @@ class DeliveryWorker:
         client = self.clients[context.dst_platform]
 
         if context.action == OutboxAction.SEND:
-            return await self._send_message(client, payload, context.dst_chat_id)
+            return await self._send_message(
+                client,
+                payload,
+                context.dst_chat_id,
+                context.dst_platform,
+            )
         if context.action == OutboxAction.EDIT:
             if context.edit_mode == EditMode.REPLACE_MEDIA_GROUP:
                 return await self._edit_media_group(
@@ -242,7 +294,7 @@ class DeliveryWorker:
                     str(payload["dst_message_id"]),
                     _payload_text_plain(payload),
                     text_html=_payload_text_html(payload),
-                    has_media=bool(payload.get("has_media")),
+                    has_media=_payload_edit_has_media(payload, context.edit_mode),
                     replacement_media=replacement_media,
                 )
                 return DeliveryResult()
@@ -272,12 +324,21 @@ class DeliveryWorker:
         client: PlatformClient,
         payload: dict[str, Any],
         chat_id: str,
+        dst_platform: Platform,
     ) -> DeliveryResult:
         media = _optional_dict(payload.get("media"))
         media_items = _payload_media_items(payload)
-        local_media = None
-        local_media_items: list[Any] = []
+        local_media_items: list[LocalMediaFile] = []
         try:
+            if media is None and not media_items:
+                return await self._send_plain_text(
+                    client,
+                    chat_id,
+                    text_plain=_payload_text_plain(payload),
+                    text_html=_payload_text_html(payload),
+                    reply_to_message_id=_optional_str(payload.get("reply_to_message_id")),
+                    shape=DeliveryShape.TEXT,
+                )
             if media_items:
                 local_media_items = await self._materialize_media_items(media_items)
             elif media is not None:
@@ -286,53 +347,39 @@ class DeliveryWorker:
                     media=media,
                     root_dir=self.root_dir,
                 )
-            if media is None and not media_items:
-                result = await client.send_text(
-                    chat_id,
-                    _payload_text_plain(payload),
-                    text_html=_payload_text_html(payload),
-                    reply_to_message_id=_optional_str(
-                        payload.get("reply_to_message_id")
-                    ),
-                )
-                return DeliveryResult(dst_message_id=result.message_id)
+                if local_media is not None:
+                    local_media_items = [local_media]
             if media_items and not local_media_items:
-                result = await client.send_text(
+                return await self._send_plain_text(
+                    client,
                     chat_id,
-                    _payload_fallback_text(payload),
-                    reply_to_message_id=_optional_str(
-                        payload.get("reply_to_message_id")
-                    ),
+                    text_plain=_payload_fallback_text(payload),
+                    reply_to_message_id=_optional_str(payload.get("reply_to_message_id")),
+                    shape=DeliveryShape.GROUP_FALLBACK_ONLY,
                 )
-                return DeliveryResult(dst_message_id=result.message_id)
-            if media is not None and local_media is None:
-                result = await client.send_text(
+            if media is not None and not local_media_items:
+                return await self._send_plain_text(
+                    client,
                     chat_id,
-                    _payload_fallback_text(payload),
-                    reply_to_message_id=_optional_str(
-                        payload.get("reply_to_message_id")
-                    ),
+                    text_plain=_payload_fallback_text(payload),
+                    reply_to_message_id=_optional_str(payload.get("reply_to_message_id")),
+                    shape=DeliveryShape.TEXT,
                 )
-                return DeliveryResult(dst_message_id=result.message_id)
-            result = await client.send_message(
-                chat_id,
-                _payload_text_plain(payload),
-                text_html=_payload_text_html(payload),
-                reply_to_message_id=_optional_str(payload.get("reply_to_message_id")),
-                media=local_media_items or local_media,
+            planned = _plan_delivery_pieces(
+                payload=payload,
+                media_items=[
+                    _materialized_media_item(dst_platform, local_media)
+                    for local_media in local_media_items
+                ],
+                source_is_group=bool(media_items),
             )
-            dst_message_ids = (
-                result.member_message_ids
-                if result.member_message_ids
-                else ((result.message_id,) if result.message_id else ())
-            )
-            return DeliveryResult(
-                dst_message_id=result.message_id,
-                dst_message_ids=dst_message_ids,
-                sent_with_media=True,
+            return await self._send_planned_pieces(
+                client=client,
+                chat_id=chat_id,
+                payload=payload,
+                planned=planned,
             )
         finally:
-            cleanup_local_media(local_media)
             for item in local_media_items:
                 cleanup_local_media(item)
 
@@ -365,12 +412,28 @@ class DeliveryWorker:
         current_media = _optional_dict(payload.get("media"))
         if src_chat_id is None or src_message_id is None:
             return EditMode.TEXT_ONLY
-        created_payload = await repo.get_created_event_payload(
+        created_send_payload = await repo.get_created_send_payload(
             bridge_id,
             src_platform,
             src_chat_id,
             src_message_id,
+            dst_platform,
         )
+        if _payload_delivery_shape(created_send_payload) == DeliveryShape.TEXT:
+            return self._log_edit_mode(
+                payload,
+                EditMode.TEXT_ONLY,
+                current_identity=_payload_media_identity(payload, current_media),
+                created_identity=_payload_media_identity(created_send_payload, None),
+            )
+        created_payload = created_send_payload
+        if created_payload is None:
+            created_payload = await repo.get_created_event_payload(
+                bridge_id,
+                src_platform,
+                src_chat_id,
+                src_message_id,
+            )
         created_media = (
             _optional_dict(created_payload.get("media"))
             if isinstance(created_payload, dict)
@@ -433,11 +496,12 @@ class DeliveryWorker:
                 current_identity=current_group_signature,
                 created_identity=None,
             )
-        created_payload = await repo.get_created_event_payload(
+        created_payload = await repo.get_created_send_payload(
             bridge_id,
             src_platform,
             src_chat_id,
             src_message_id,
+            dst_platform,
         )
         created_group_signature = _payload_media_group_signature(created_payload)
         current_group_identities = _payload_media_group_identities(payload)
@@ -445,7 +509,9 @@ class DeliveryWorker:
         mode = (
             EditMode.CAPTION_ONLY_SAME_MEDIA
             if (
-                current_group_identities is not None
+                _payload_delivery_shape(created_payload) == DeliveryShape.GROUP_SINGLE_PIECE
+                and not _payload_delivery_media_filtered(created_payload)
+                and current_group_identities is not None
                 and created_group_identities is not None
                 and current_group_identities == created_group_identities
             )
@@ -490,44 +556,15 @@ class DeliveryWorker:
         chat_id: str,
         dst_platform: Platform,
     ) -> DeliveryResult:
-        if dst_platform == Platform.TELEGRAM:
-            for message_id in _payload_dst_message_ids(payload):
-                await client.delete_message(chat_id, message_id)
-            return await self._send_message(client, payload, chat_id)
-
-        media_items = _payload_media_items(payload)
-        if not media_items:
-            raise PlatformDeliveryError(
-                "Mirrored media group edit is missing media_items",
-                retryable=False,
-                code="invalid_media_group_payload",
-            )
-        local_media_items = await self._materialize_media_items(media_items)
-        if not local_media_items:
-            raise PlatformDeliveryError(
-                "Replacement media group for edit is unavailable",
-                retryable=False,
-                code="replacement_media_unavailable",
-            )
-        try:
-            await client.edit_message(
-                chat_id,
-                str(payload["dst_message_id"]),
-                _payload_text_plain(payload),
-                text_html=_payload_text_html(payload),
-                has_media=True,
-                replacement_media=local_media_items,
-            )
-        finally:
-            for item in local_media_items:
-                cleanup_local_media(item)
-        return DeliveryResult()
+        for message_id in _payload_dst_message_ids(payload):
+            await client.delete_message(chat_id, message_id)
+        return await self._send_message(client, payload, chat_id, dst_platform)
 
     async def _materialize_media_items(
         self,
         media_items: list[dict[str, Any]],
-    ) -> list[Any]:
-        local_media_items: list[Any] = []
+    ) -> list[LocalMediaFile]:
+        local_media_items: list[LocalMediaFile] = []
         for media in media_items:
             local_media = await materialize_media(
                 clients=self.clients,
@@ -540,6 +577,109 @@ class DeliveryWorker:
                 return []
             local_media_items.append(local_media)
         return local_media_items
+
+    async def _send_plain_text(
+        self,
+        client: PlatformClient,
+        chat_id: str,
+        *,
+        text_plain: str,
+        text_html: str | None = None,
+        reply_to_message_id: str | None = None,
+        shape: DeliveryShape,
+        media_filtered: bool = False,
+    ) -> DeliveryResult:
+        result = await client.send_text(
+            chat_id,
+            text_plain,
+            text_html=text_html,
+            reply_to_message_id=reply_to_message_id,
+        )
+        emitted_ids = (result.message_id,)
+        return DeliveryResult(
+            dst_message_id=result.message_id,
+            dst_message_ids=emitted_ids,
+            sent_with_media=False,
+            delivery_state=DeliveryStateSnapshot(
+                shape=shape,
+                media_filtered=media_filtered,
+                emitted_message_ids=emitted_ids,
+            ),
+        )
+
+    async def _send_planned_pieces(
+        self,
+        *,
+        client: PlatformClient,
+        chat_id: str,
+        payload: dict[str, Any],
+        planned: PlannedDeliveryPieces,
+    ) -> DeliveryResult:
+        queue = list(planned.pieces)
+        emitted_ids: list[str] = []
+        media_piece_count = 0
+        hint_piece_count = 0
+        media_text_consumed = False
+        media_filtered = planned.media_filtered
+        reply_to_message_id = _optional_str(payload.get("reply_to_message_id"))
+        base_text_plain = _payload_text_plain(payload)
+        base_text_html = _payload_text_html(payload)
+
+        while queue:
+            piece = queue.pop(0)
+            if isinstance(piece, HintPiece):
+                result = await client.send_text(
+                    chat_id,
+                    piece.text_plain,
+                    reply_to_message_id=(
+                        reply_to_message_id if not emitted_ids else None
+                    ),
+                )
+                emitted_ids.append(result.message_id)
+                hint_piece_count += 1
+                continue
+
+            try:
+                send_result = await client.send_message(
+                    chat_id,
+                    base_text_plain if not media_text_consumed else "",
+                    text_html=base_text_html if not media_text_consumed else None,
+                    reply_to_message_id=(
+                        reply_to_message_id if not emitted_ids else None
+                    ),
+                    media=_piece_media_argument(piece),
+                )
+            except PlatformDeliveryError as exc:
+                if _is_entity_too_large_error(exc):
+                    media_filtered = True
+                    if len(piece.items) > 1:
+                        queue[0:0] = list(_split_media_piece(piece))
+                        continue
+                    queue.insert(0, HintPiece(piece.items[0].oversize_hint))
+                    continue
+                raise
+
+            emitted_piece_ids = _send_result_message_ids(send_result)
+            emitted_ids.extend(emitted_piece_ids)
+            media_piece_count += 1
+            media_text_consumed = True
+
+        primary_id = emitted_ids[0] if emitted_ids else None
+        delivery_state = DeliveryStateSnapshot(
+            shape=_delivery_shape_for_result(
+                source_is_group=planned.source_is_group,
+                media_piece_count=media_piece_count,
+                hint_piece_count=hint_piece_count,
+            ),
+            media_filtered=media_filtered,
+            emitted_message_ids=tuple(emitted_ids),
+        )
+        return DeliveryResult(
+            dst_message_id=primary_id,
+            dst_message_ids=tuple(emitted_ids),
+            sent_with_media=media_piece_count > 0,
+            delivery_state=delivery_state,
+        )
 
     async def _lease_heartbeat(
         self,
@@ -608,6 +748,7 @@ class DeliveryWorker:
                     src_member_message_ids=_payload_source_member_message_ids(
                         context.payload
                     ),
+                    delivery_state=_delivery_state_payload(result.delivery_state),
                 )
                 if finalized and post_send_payload is not None:
                     if context.src_event_id is None:
@@ -766,6 +907,36 @@ def _payload_fallback_text(payload: dict[str, Any]) -> str:
     return str(legacy) if legacy is not None else ""
 
 
+def _payload_edit_has_media(payload: dict[str, Any], edit_mode: EditMode) -> bool:
+    return bool(payload.get("has_media")) and edit_mode != EditMode.TEXT_ONLY
+
+
+def _fallback_text_with_hints(
+    payload: dict[str, Any],
+    hints: list[str],
+) -> str:
+    lines: list[str] = []
+    text_plain = _payload_text_plain(payload)
+    if text_plain:
+        lines.append(text_plain)
+    lines.extend(hint for hint in hints if hint)
+    if lines:
+        return "\n".join(lines)
+    return _payload_fallback_text(payload)
+
+
+def _delivery_state_payload(
+    delivery_state: DeliveryStateSnapshot | None,
+) -> dict[str, Any] | None:
+    if delivery_state is None:
+        return None
+    return {
+        "shape": delivery_state.shape.value,
+        "media_filtered": delivery_state.media_filtered,
+        "emitted_message_ids": list(delivery_state.emitted_message_ids),
+    }
+
+
 def _payload_post_send_text_plain(payload: dict[str, Any]) -> str | None:
     value = payload.get("post_send_text_plain")
     if isinstance(value, str) and value:
@@ -815,6 +986,144 @@ def _is_media_group_payload(payload: dict[str, Any]) -> bool:
     return _payload_group_kind(payload) == "photo_video_chunk" and bool(
         _payload_media_items(payload)
     )
+
+
+def _materialized_media_item(
+    dst_platform: Platform,
+    local_file: LocalMediaFile,
+) -> MaterializedMediaItem:
+    byte_size = local_file.path.stat().st_size
+    return MaterializedMediaItem(
+        local_file=local_file,
+        byte_size=byte_size,
+        upload_limit_bytes=destination_media_upload_limit_bytes(
+            dst_platform,
+            local_file,
+        ),
+        oversize_hint=destination_upload_oversize_hint(
+            dst_platform,
+            local_file.kind,
+            presentation=local_file.presentation,
+        ),
+    )
+
+
+def _plan_delivery_pieces(
+    *,
+    payload: dict[str, Any],
+    media_items: list[MaterializedMediaItem],
+    source_is_group: bool,
+) -> PlannedDeliveryPieces:
+    if not source_is_group:
+        if not media_items:
+            return PlannedDeliveryPieces((), False, False)
+        item = media_items[0]
+        if item.byte_size > item.upload_limit_bytes:
+            return PlannedDeliveryPieces(
+                (
+                    HintPiece(
+                        _fallback_text_with_hints(payload, [item.oversize_hint])
+                    ),
+                ),
+                False,
+                True,
+            )
+        return PlannedDeliveryPieces((MediaPiece((item,)),), False, False)
+
+    pieces: list[MediaPiece | HintPiece] = []
+    current_piece: list[MaterializedMediaItem] = []
+    current_piece_bytes = 0
+    filtered_hints: list[str] = []
+    media_filtered = False
+    sendable_found = False
+
+    for item in media_items:
+        if item.byte_size > item.upload_limit_bytes:
+            if current_piece:
+                pieces.append(MediaPiece(tuple(current_piece)))
+                current_piece = []
+                current_piece_bytes = 0
+            pieces.append(HintPiece(item.oversize_hint))
+            filtered_hints.append(item.oversize_hint)
+            media_filtered = True
+            continue
+
+        sendable_found = True
+        would_exceed_count = len(current_piece) >= OUTBOUND_MEDIA_COUNT_LIMIT
+        would_exceed_budget = (
+            bool(current_piece)
+            and current_piece_bytes + item.byte_size > OUTBOUND_MEDIA_PIECE_BUDGET_BYTES
+        )
+        if would_exceed_count or would_exceed_budget:
+            pieces.append(MediaPiece(tuple(current_piece)))
+            current_piece = []
+            current_piece_bytes = 0
+
+        current_piece.append(item)
+        current_piece_bytes += item.byte_size
+
+    if current_piece:
+        pieces.append(MediaPiece(tuple(current_piece)))
+
+    if not sendable_found:
+        return PlannedDeliveryPieces(
+            (
+                HintPiece(_fallback_text_with_hints(payload, filtered_hints)),
+            ),
+            True,
+            media_filtered,
+        )
+    return PlannedDeliveryPieces(tuple(pieces), True, media_filtered)
+
+
+def _piece_media_argument(
+    piece: MediaPiece,
+) -> LocalMediaFile | list[LocalMediaFile]:
+    media_files = [item.local_file for item in piece.items]
+    if len(media_files) == 1:
+        return media_files[0]
+    return media_files
+
+
+def _split_media_piece(piece: MediaPiece) -> tuple[MediaPiece, ...]:
+    if len(piece.items) <= 1:
+        return (piece,)
+    midpoint = len(piece.items) // 2
+    return (
+        MediaPiece(piece.items[:midpoint]),
+        MediaPiece(piece.items[midpoint:]),
+    )
+
+
+def _send_result_message_ids(result: Any) -> tuple[str, ...]:
+    member_message_ids = getattr(result, "member_message_ids", ())
+    if member_message_ids:
+        return tuple(str(message_id) for message_id in member_message_ids)
+    message_id = _optional_str(getattr(result, "message_id", None))
+    return (message_id,) if message_id is not None else ()
+
+
+def _delivery_shape_for_result(
+    *,
+    source_is_group: bool,
+    media_piece_count: int,
+    hint_piece_count: int,
+) -> DeliveryShape:
+    if not source_is_group:
+        return DeliveryShape.SINGLE_MEDIA if media_piece_count else DeliveryShape.TEXT
+    if media_piece_count == 0:
+        return DeliveryShape.GROUP_FALLBACK_ONLY
+    if media_piece_count == 1 and hint_piece_count == 0:
+        return DeliveryShape.GROUP_SINGLE_PIECE
+    return DeliveryShape.GROUP_MULTI_PIECE
+
+
+def _is_entity_too_large_error(exc: PlatformDeliveryError) -> bool:
+    if exc.http_status == 413 or exc.code == "entity_too_large":
+        return True
+    code = (exc.code or "").casefold()
+    message = str(exc).casefold()
+    return "entity too large" in code or "entity too large" in message
 
 
 def _payload_creates_mapping(payload: dict[str, Any]) -> bool:
@@ -902,6 +1211,32 @@ def _payload_media_group_signature(
     if identities is None:
         return None
     return stable_json_hash(identities)
+
+
+def _payload_delivery_shape(
+    payload: dict[str, Any] | None,
+) -> DeliveryShape | None:
+    if not isinstance(payload, dict):
+        return None
+    delivery_state = _optional_dict(payload.get("delivery_state"))
+    if delivery_state is None:
+        return None
+    shape = delivery_state.get("shape")
+    if not isinstance(shape, str) or not shape:
+        return None
+    try:
+        return DeliveryShape(shape)
+    except ValueError:
+        return None
+
+
+def _payload_delivery_media_filtered(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    delivery_state = _optional_dict(payload.get("delivery_state"))
+    if delivery_state is None:
+        return False
+    return bool(delivery_state.get("media_filtered"))
 
 
 def _payload_media_group_kind(payload: dict[str, Any] | None) -> str | None:

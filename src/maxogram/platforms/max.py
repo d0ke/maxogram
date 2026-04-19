@@ -318,12 +318,15 @@ class MaxClient:
 
 def _max_error(exc: MaxApiError) -> PlatformDeliveryError:
     raw = exc.raw.lower() if isinstance(exc.raw, str) else str(exc.raw).lower()
-    permanent = exc.code in {400, 401, 403, 404} and "attachment.not.ready" not in raw
+    oversize = exc.code == 413 or "entity too large" in raw or "too large" in raw
+    permanent = oversize or (
+        exc.code in {400, 401, 403, 404} and "attachment.not.ready" not in raw
+    )
     return PlatformDeliveryError(
         str(exc),
         retryable=not permanent,
-        code=str(exc.code),
-        http_status=exc.code,
+        code="entity_too_large" if oversize else str(exc.code),
+        http_status=413 if oversize else exc.code,
     )
 
 

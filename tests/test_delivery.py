@@ -45,6 +45,8 @@ class FakeClient:
         on_send_text: Any | None = None,
         on_send_message: Any | None = None,
         assert_no_active_transaction: bool = False,
+        download_size_bytes: int = 5,
+        download_size_by_identity: dict[str, int] | None = None,
     ) -> None:
         self.name = name
         self.state = state
@@ -54,6 +56,8 @@ class FakeClient:
         self.on_send_text = on_send_text
         self.on_send_message = on_send_message
         self.assert_no_active_transaction = assert_no_active_transaction
+        self.download_size_bytes = download_size_bytes
+        self.download_size_by_identity = dict(download_size_by_identity or {})
         self.send_text_calls: list[dict[str, Any]] = []
         self.send_message_calls: list[dict[str, Any]] = []
         self.edit_calls: list[dict[str, Any]] = []
@@ -122,7 +126,7 @@ class FakeClient:
         if self.send_delay:
             await asyncio.sleep(self.send_delay)
         member_message_ids: tuple[str, ...] = ()
-        if isinstance(media, list) and media:
+        if self.name == "telegram" and isinstance(media, list) and media:
             member_message_ids = tuple(
                 f"{self.name}-media-{len(self.send_message_calls)}-{index}"
                 for index in range(1, len(media) + 1)
@@ -175,7 +179,12 @@ class FakeClient:
             return None
         filename = str(media.get("filename") or "relay.bin")
         destination = destination_dir / f"{uuid.uuid4()}-{filename}"
-        await asyncio.to_thread(destination.write_bytes, b"media")
+        identity = str(media.get("identity") or "")
+        download_size = self.download_size_by_identity.get(
+            identity,
+            self.download_size_bytes,
+        )
+        await asyncio.to_thread(_write_file_of_size, destination, download_size)
         return LocalMediaFile(
             kind=self.download_kind,
             path=destination,
@@ -215,10 +224,16 @@ class DeliveryState:
     created_payloads: dict[
         tuple[uuid.UUID, Platform, str, str], dict[str, Any]
     ] = field(default_factory=dict)
+    created_send_snapshots: dict[
+        tuple[uuid.UUID, Platform, str, str, Platform], dict[str, Any]
+    ] = field(default_factory=dict)
     pending_rows: list[Any] = field(default_factory=list)
     canonical_event_ids: dict[str, uuid.UUID] = field(default_factory=dict)
     bridge_chats: dict[tuple[uuid.UUID, Platform], Any] = field(default_factory=dict)
     mappings: list[dict[str, Any]] = field(default_factory=list)
+    chunk_destination_ids: dict[
+        tuple[uuid.UUID, Platform, str, str], list[str]
+    ] = field(default_factory=dict)
     attempts: list[dict[str, Any]] = field(default_factory=list)
     dead_letters: list[dict[str, Any]] = field(default_factory=list)
     active_transactions: int = 0
@@ -283,6 +298,18 @@ class FakeRepository:
             (bridge_id, src_platform, src_chat_id, src_message_id)
         )
 
+    async def get_created_send_payload(
+        self,
+        bridge_id: uuid.UUID,
+        src_platform: Platform,
+        src_chat_id: str,
+        src_message_id: str,
+        dst_platform: Platform,
+    ) -> dict[str, Any] | None:
+        return self.state.created_send_snapshots.get(
+            (bridge_id, src_platform, src_chat_id, src_message_id, dst_platform)
+        )
+
     async def renew_outbox_lease(
         self,
         outbox_id: uuid.UUID,
@@ -313,13 +340,27 @@ class FakeRepository:
         src_message_id: str | None,
         group_kind: str | None = None,
         src_member_message_ids: list[str] | None = None,
+        delivery_state: dict[str, Any] | None = None,
     ) -> bool:
-        _ = dst_message_ids, group_kind, src_member_message_ids
         task = self.state.tasks.get(outbox_id)
         if task is None:
             return False
         if not _matches_attempt(task, attempt_count):
             return False
+        effective_dst_message_ids = (
+            list(dst_message_ids)
+            if dst_message_ids
+            else ([dst_message_id] if dst_message_id is not None else [])
+        )
+        updated_payload = dict(task.task)
+        if effective_dst_message_ids:
+            updated_payload["dst_message_id"] = effective_dst_message_ids[0]
+            updated_payload["dst_message_ids"] = effective_dst_message_ids
+        elif dst_message_id is not None:
+            updated_payload["dst_message_id"] = dst_message_id
+        if delivery_state is not None:
+            updated_payload["delivery_state"] = delivery_state
+        task.task = updated_payload
         if (
             dst_message_id is not None
             and src_platform is not None
@@ -337,6 +378,13 @@ class FakeRepository:
                     "dst_message_id": dst_message_id,
                 }
             )
+            self.state.created_send_snapshots[
+                (bridge_id, src_platform, src_chat_id, src_message_id, dst_platform)
+            ] = dict(updated_payload)
+            if group_kind is not None:
+                self.state.chunk_destination_ids[
+                    (bridge_id, src_platform, src_chat_id, src_message_id)
+                ] = effective_dst_message_ids
         task.status = TaskStatus.DONE
         task.inflight_until = None
         self.state.attempts.append(
@@ -441,6 +489,11 @@ class FakeRepository:
         src_chat_id: str,
         src_message_id: str,
     ) -> list[str]:
+        chunk_ids = self.state.chunk_destination_ids.get(
+            (bridge_id, src_platform, src_chat_id, src_message_id)
+        )
+        if chunk_ids:
+            return list(chunk_ids)
         for mapping in self.state.mappings:
             if (
                 mapping["bridge_id"] == bridge_id
@@ -676,6 +729,11 @@ def media_payload(
     return payload
 
 
+def _write_file_of_size(path: Path, size: int) -> None:
+    with path.open("wb") as handle:
+        handle.truncate(size)
+
+
 class FakeTelegramMessage:
     def __init__(self, message_id: int, kind: str) -> None:
         self.message_id = message_id
@@ -724,6 +782,37 @@ class DeliveryTelegramBot:
     async def edit_message_media(self, **kwargs: object) -> FakeTelegramMessage:
         self.edit_message_media_calls.append(dict(kwargs))
         return FakeTelegramMessage(5004, "media")
+
+
+class OversizeMultiMediaClient(FakeClient):
+    async def send_message(
+        self,
+        chat_id: str,
+        text_plain: str,
+        *,
+        text_html: str | None = None,
+        reply_to_message_id: str | None = None,
+        media: LocalMediaFile | list[LocalMediaFile] | None = None,
+    ) -> SendResult:
+        media_items = (
+            media
+            if isinstance(media, list)
+            else ([media] if media is not None else [])
+        )
+        if len(media_items) > 1:
+            raise PlatformDeliveryError(
+                "Request Entity Too Large",
+                retryable=False,
+                code="entity_too_large",
+                http_status=413,
+            )
+        return await super().send_message(
+            chat_id,
+            text_plain,
+            text_html=text_html,
+            reply_to_message_id=reply_to_message_id,
+            media=media,
+        )
 
 
 def _matches_attempt(task: Any | None, attempt_count: int) -> bool:
@@ -837,6 +926,279 @@ async def test_delivery_sends_max_photo_video_chunk_to_telegram_as_media_group(
 
 
 @pytest.mark.asyncio
+async def test_delivery_splits_max_group_to_telegram_by_total_bytes(tmp_path: Path):
+    telegram = FakeClient("telegram")
+    media_items = [
+        media_payload(
+            source_platform=Platform.MAX,
+            kind="image",
+            identity=f"max:image:id:photo-{index}",
+            filename=f"{index}.jpg",
+            mime_type="image/jpeg",
+        )
+        for index in range(1, 11)
+    ]
+    max_client = FakeClient(
+        "max",
+        download_kind=MediaKind.IMAGE,
+        download_size_by_identity={
+            f"max:image:id:photo-{index}": 6 * 1024 * 1024 for index in range(1, 11)
+        },
+    )
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+    )
+    context = make_context(
+        action="send",
+        bridge_id=uuid.uuid4(),
+        dst_platform=Platform.TELEGRAM,
+        task_payload={
+            "src": {"platform": "max", "chat_id": "300", "message_id": "mid-budget"},
+            "dst": {"platform": "telegram", "chat_id": "-100"},
+            "text": "Alice: album",
+            "fallback_text": "Alice: [photo group]",
+            "has_media": True,
+            "media_kind": "photo_video_chunk",
+            "group_kind": "photo_video_chunk",
+            "group_key": "max:300:mid-budget",
+            "media": None,
+            "media_items": media_items,
+        },
+    )
+
+    result = await worker._call_platform(context)
+
+    assert len(telegram.send_message_calls) == 2
+    first_piece = cast(list[Any], telegram.send_message_calls[0]["media"])
+    second_piece = cast(list[Any], telegram.send_message_calls[1]["media"])
+    assert len(first_piece) == 8
+    assert len(second_piece) == 2
+    assert result.dst_message_id == "telegram-media-1-1"
+    assert len(result.dst_message_ids) == 10
+
+
+@pytest.mark.asyncio
+async def test_delivery_filters_oversize_max_group_item_for_telegram(tmp_path: Path):
+    telegram = FakeClient("telegram")
+    max_client = FakeClient(
+        "max",
+        download_kind=MediaKind.IMAGE,
+        download_size_by_identity={
+            "max:image:id:photo-1": 8 * 1024 * 1024,
+            "max:image:id:photo-2": 12 * 1024 * 1024,
+            "max:image:id:photo-3": 8 * 1024 * 1024,
+        },
+    )
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+    )
+    context = make_context(
+        action="send",
+        bridge_id=uuid.uuid4(),
+        dst_platform=Platform.TELEGRAM,
+        task_payload={
+            "src": {"platform": "max", "chat_id": "300", "message_id": "mid-oversize"},
+            "dst": {"platform": "telegram", "chat_id": "-100"},
+            "text": "Alice: album",
+            "fallback_text": "Alice: [photo group]",
+            "has_media": True,
+            "media_kind": "photo_video_chunk",
+            "group_kind": "photo_video_chunk",
+            "group_key": "max:300:mid-oversize",
+            "media": None,
+            "media_items": [
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-1",
+                    filename="one.jpg",
+                    mime_type="image/jpeg",
+                ),
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-2",
+                    filename="two.jpg",
+                    mime_type="image/jpeg",
+                ),
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-3",
+                    filename="three.jpg",
+                    mime_type="image/jpeg",
+                ),
+            ],
+        },
+    )
+
+    result = await worker._call_platform(context)
+
+    assert len(telegram.send_message_calls) == 2
+    assert len(telegram.send_text_calls) == 1
+    assert (
+        telegram.send_text_calls[0]["text"]
+        == "[image unavailable: exceeds Telegram 10 MB upload limit]"
+    )
+    assert result.dst_message_ids == (
+        "telegram-media-1",
+        "telegram-text-1",
+        "telegram-media-2",
+    )
+
+
+@pytest.mark.asyncio
+async def test_delivery_splits_telegram_group_to_max_by_total_bytes(tmp_path: Path):
+    telegram = FakeClient(
+        "telegram",
+        download_kind=MediaKind.VIDEO,
+        download_size_by_identity={
+            "telegram:video:id:file-1": 20 * 1024 * 1024,
+            "telegram:video:id:file-2": 20 * 1024 * 1024,
+            "telegram:video:id:file-3": 20 * 1024 * 1024,
+        },
+    )
+    max_client = FakeClient("max")
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+    )
+    context = make_context(
+        action="send",
+        bridge_id=uuid.uuid4(),
+        dst_platform=Platform.MAX,
+        task_payload={
+            "src": {"platform": "telegram", "chat_id": "-100", "message_id": "grp-1"},
+            "dst": {"platform": "max", "chat_id": "200"},
+            "text": "Alice: album",
+            "fallback_text": "Alice: [video group]",
+            "has_media": True,
+            "media_kind": "photo_video_chunk",
+            "group_kind": "photo_video_chunk",
+            "group_key": "telegram:-100:grp-1",
+            "media": None,
+            "media_items": [
+                media_payload(
+                    source_platform=Platform.TELEGRAM,
+                    kind="video",
+                    identity="telegram:video:id:file-1",
+                    filename="one.mp4",
+                    mime_type="video/mp4",
+                ),
+                media_payload(
+                    source_platform=Platform.TELEGRAM,
+                    kind="video",
+                    identity="telegram:video:id:file-2",
+                    filename="two.mp4",
+                    mime_type="video/mp4",
+                ),
+                media_payload(
+                    source_platform=Platform.TELEGRAM,
+                    kind="video",
+                    identity="telegram:video:id:file-3",
+                    filename="three.mp4",
+                    mime_type="video/mp4",
+                ),
+            ],
+        },
+    )
+
+    result = await worker._call_platform(context)
+
+    assert len(max_client.send_message_calls) == 2
+    first_piece = cast(list[Any], max_client.send_message_calls[0]["media"])
+    second_piece = max_client.send_message_calls[1]["media"]
+    assert len(first_piece) == 2
+    assert cast(Any, second_piece).kind == MediaKind.VIDEO
+    assert result.dst_message_ids == ("max-media-1", "max-media-2")
+
+
+@pytest.mark.asyncio
+async def test_delivery_filters_oversize_telegram_group_item_for_max(tmp_path: Path):
+    telegram = FakeClient(
+        "telegram",
+        download_kind=MediaKind.VIDEO,
+        download_size_by_identity={
+            "telegram:video:id:file-1": 45 * 1024 * 1024,
+            "telegram:video:id:file-2": 51 * 1024 * 1024,
+            "telegram:video:id:file-3": 45 * 1024 * 1024,
+        },
+    )
+    max_client = FakeClient("max")
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+    )
+    context = make_context(
+        action="send",
+        bridge_id=uuid.uuid4(),
+        dst_platform=Platform.MAX,
+        task_payload={
+            "src": {"platform": "telegram", "chat_id": "-100", "message_id": "grp-max"},
+            "dst": {"platform": "max", "chat_id": "200"},
+            "text": "Alice: album",
+            "fallback_text": "Alice: [video group]",
+            "has_media": True,
+            "media_kind": "photo_video_chunk",
+            "group_kind": "photo_video_chunk",
+            "group_key": "telegram:-100:grp-max",
+            "media": None,
+            "media_items": [
+                media_payload(
+                    source_platform=Platform.TELEGRAM,
+                    kind="video",
+                    identity="telegram:video:id:file-1",
+                    filename="one.mp4",
+                    mime_type="video/mp4",
+                ),
+                media_payload(
+                    source_platform=Platform.TELEGRAM,
+                    kind="video",
+                    identity="telegram:video:id:file-2",
+                    filename="two.mp4",
+                    mime_type="video/mp4",
+                ),
+                media_payload(
+                    source_platform=Platform.TELEGRAM,
+                    kind="video",
+                    identity="telegram:video:id:file-3",
+                    filename="three.mp4",
+                    mime_type="video/mp4",
+                ),
+            ],
+        },
+    )
+
+    result = await worker._call_platform(context)
+
+    assert len(max_client.send_message_calls) == 2
+    assert len(max_client.send_text_calls) == 1
+    assert (
+        max_client.send_text_calls[0]["text"]
+        == "[video unavailable: exceeds MAX 50 MB upload limit]"
+    )
+    assert result.dst_message_ids == (
+        "max-media-1",
+        "max-text-1",
+        "max-media-2",
+    )
+
+
+@pytest.mark.asyncio
 async def test_delivery_sends_max_document_to_telegram_as_media(tmp_path: Path):
     telegram = FakeClient("telegram")
     max_client = FakeClient("max", download_kind=MediaKind.DOCUMENT)
@@ -871,6 +1233,112 @@ async def test_delivery_sends_max_document_to_telegram_as_media(tmp_path: Path):
     assert len(max_client.download_calls) == 1
     assert len(telegram.send_message_calls) == 1
     assert telegram.send_message_calls[0]["media"].kind == MediaKind.DOCUMENT
+
+
+@pytest.mark.asyncio
+async def test_delivery_falls_back_for_oversize_max_photo_to_telegram(tmp_path: Path):
+    telegram = FakeClient("telegram")
+    max_client = FakeClient(
+        "max",
+        download_kind=MediaKind.IMAGE,
+        download_size_by_identity={"max:image:id:photo_id:999": 11 * 1024 * 1024},
+    )
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+    )
+    context = make_context(
+        action="send",
+        bridge_id=uuid.uuid4(),
+        dst_platform=Platform.TELEGRAM,
+        task_payload={
+            "src": {"platform": "max", "chat_id": "300", "message_id": "mid-big-photo"},
+            "dst": {"platform": "telegram", "chat_id": "-100"},
+            "text": "Alice: caption",
+            "fallback_text": "Alice: [photo]",
+            "has_media": True,
+            "media_kind": "image",
+            "media": media_payload(
+                source_platform=Platform.MAX,
+                kind="image",
+                identity="max:image:id:photo_id:999",
+                filename="big.jpg",
+                mime_type="image/jpeg",
+            ),
+        },
+    )
+
+    result = await worker._call_platform(context)
+
+    assert telegram.send_message_calls == []
+    assert len(telegram.send_text_calls) == 1
+    assert (
+        telegram.send_text_calls[0]["text"]
+        == "Alice: caption\n[image unavailable: exceeds Telegram 10 MB upload limit]"
+    )
+    assert result.dst_message_id == "telegram-text-1"
+
+
+@pytest.mark.asyncio
+async def test_delivery_falls_back_for_oversize_telegram_video_to_max_without_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    task = make_task(
+        action="send",
+        bridge_id=uuid.uuid4(),
+        dst_platform=Platform.MAX,
+        task_payload={
+            "src": {"platform": "telegram", "chat_id": "-100", "message_id": "big-video"},
+            "dst": {"platform": "max", "chat_id": "200"},
+            "text": "Alice: caption",
+            "fallback_text": "Alice: [video]",
+            "has_media": True,
+            "media_kind": "video",
+            "media": media_payload(
+                source_platform=Platform.TELEGRAM,
+                kind="video",
+                identity="telegram:video:id:big-video",
+                filename="big.mp4",
+                mime_type="video/mp4",
+            ),
+        },
+    )
+    state = DeliveryState(tasks={task.outbox_id: task})
+    database = FakeDatabase(state)
+    telegram = FakeClient(
+        "telegram",
+        state=state,
+        download_kind=MediaKind.VIDEO,
+        download_size_by_identity={"telegram:video:id:big-video": 51 * 1024 * 1024},
+    )
+    max_client = FakeClient("max", state=state)
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+        database=database,
+    )
+    monkeypatch.setattr("maxogram.workers.delivery.Repository", FakeRepository)
+
+    processed = await worker.run_once()
+
+    assert processed == 1
+    assert max_client.send_message_calls == []
+    assert len(max_client.send_text_calls) == 1
+    assert state.tasks[task.outbox_id].status == TaskStatus.DONE
+    assert state.attempts == [
+        {
+            "outbox_id": task.outbox_id,
+            "attempt_no": 1,
+            "outcome": DeliveryOutcome.SUCCESS,
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -1851,7 +2319,7 @@ async def test_delivery_edits_max_group_caption_on_telegram_without_recreating_a
 
 
 @pytest.mark.asyncio
-async def test_delivery_replaces_max_media_group_with_full_attachment_array(
+async def test_delivery_recreates_max_media_group_with_full_attachment_array(
     tmp_path: Path,
 ):
     telegram = FakeClient("telegram", download_kind=MediaKind.IMAGE)
@@ -1875,6 +2343,7 @@ async def test_delivery_replaces_max_media_group_with_full_attachment_array(
             },
             "dst": {"platform": "max", "chat_id": "200"},
             "dst_message_id": "max-msg-1",
+            "dst_message_ids": ["max-msg-1", "max-msg-2"],
             "text": "Alice: updated album",
             "has_media": True,
             "media": None,
@@ -1903,9 +2372,14 @@ async def test_delivery_replaces_max_media_group_with_full_attachment_array(
     await worker._call_platform(context)
 
     assert len(telegram.download_calls) == 2
-    assert len(max_client.edit_calls) == 1
-    replacement_media = cast(list[Any], max_client.edit_calls[0]["replacement_media"])
+    assert max_client.delete_calls == [
+        {"chat_id": "200", "message_id": "max-msg-1"},
+        {"chat_id": "200", "message_id": "max-msg-2"},
+    ]
+    assert len(max_client.send_message_calls) == 1
+    replacement_media = cast(list[Any], max_client.send_message_calls[0]["media"])
     assert len(replacement_media) == 2
+    assert max_client.edit_calls == []
 
 
 @pytest.mark.asyncio
@@ -2067,6 +2541,52 @@ async def test_classify_edit_mode_detects_max_photo_replacement(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_classify_edit_mode_treats_text_fallback_media_as_text_only(
+    tmp_path: Path,
+):
+    bridge_id = uuid.uuid4()
+    state = DeliveryState(tasks={})
+    repo = FakeRepository(FakeSession(state))
+    telegram = FakeClient("telegram")
+    max_client = FakeClient("max")
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+    )
+    state.created_send_snapshots[
+        (bridge_id, Platform.MAX, "300", "mid-fallback", Platform.TELEGRAM)
+    ] = {
+        "delivery_state": {
+            "shape": "text",
+            "media_filtered": True,
+            "emitted_message_ids": ["55"],
+        },
+        "media": {"identity": "max:image:id:photo_id:123"},
+    }
+
+    mode = await worker._classify_edit_mode(
+        repo=cast(Any, repo),
+        bridge_id=bridge_id,
+        payload={
+            "src": {"platform": "max", "chat_id": "300", "message_id": "mid-fallback"},
+            "dst": {"platform": "telegram", "chat_id": "-100"},
+            "media": media_payload(
+                source_platform=Platform.MAX,
+                kind="image",
+                identity="max:image:id:photo_id:123",
+            ),
+            "has_media": True,
+        },
+        action=OutboxAction.EDIT,
+    )
+
+    assert mode == EditMode.TEXT_ONLY
+
+
+@pytest.mark.asyncio
 async def test_classify_edit_mode_keeps_same_max_group_as_caption_only(tmp_path: Path):
     bridge_id = uuid.uuid4()
     state = DeliveryState(tasks={})
@@ -2080,7 +2600,14 @@ async def test_classify_edit_mode_keeps_same_max_group_as_caption_only(tmp_path:
             Platform.MAX: max_client,
         },
     )
-    state.created_payloads[(bridge_id, Platform.MAX, "300", "mid-group")] = {
+    state.created_send_snapshots[
+        (bridge_id, Platform.MAX, "300", "mid-group", Platform.TELEGRAM)
+    ] = {
+        "delivery_state": {
+            "shape": "group_single_piece",
+            "media_filtered": False,
+            "emitted_message_ids": ["55", "56"],
+        },
         "media_group": {
             "group_kind": "photo_video_chunk",
             "items": [
@@ -2140,7 +2667,14 @@ async def test_classify_edit_mode_recreates_max_group_when_any_item_changes(
             Platform.MAX: max_client,
         },
     )
-    state.created_payloads[(bridge_id, Platform.MAX, "300", "mid-group")] = {
+    state.created_send_snapshots[
+        (bridge_id, Platform.MAX, "300", "mid-group", Platform.TELEGRAM)
+    ] = {
+        "delivery_state": {
+            "shape": "group_single_piece",
+            "media_filtered": False,
+            "emitted_message_ids": ["55", "56"],
+        },
         "media_group": {
             "group_kind": "photo_video_chunk",
             "items": [
@@ -2252,6 +2786,180 @@ async def test_delivery_deletes_mirrored_message(tmp_path: Path):
     await worker._call_platform(context)
 
     assert telegram.delete_calls == [{"chat_id": "-100", "message_id": "55"}]
+
+
+@pytest.mark.asyncio
+async def test_delivery_refines_oversize_group_piece_in_same_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    task = make_task(
+        action="send",
+        bridge_id=uuid.uuid4(),
+        dst_platform=Platform.TELEGRAM,
+        task_payload={
+            "src": {"platform": "max", "chat_id": "300", "message_id": "mid-refine"},
+            "dst": {"platform": "telegram", "chat_id": "-100"},
+            "text": "Alice: album",
+            "fallback_text": "Alice: [photo group]",
+            "has_media": True,
+            "media_kind": "photo_video_chunk",
+            "group_kind": "photo_video_chunk",
+            "group_key": "max:300:mid-refine",
+            "media": None,
+            "media_items": [
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-a",
+                    filename="a.jpg",
+                    mime_type="image/jpeg",
+                ),
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-b",
+                    filename="b.jpg",
+                    mime_type="image/jpeg",
+                ),
+            ],
+        },
+    )
+    state = DeliveryState(tasks={task.outbox_id: task})
+    database = FakeDatabase(state)
+    telegram = OversizeMultiMediaClient("telegram", state=state)
+    max_client = FakeClient("max", state=state, download_kind=MediaKind.IMAGE)
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+        database=database,
+    )
+    monkeypatch.setattr("maxogram.workers.delivery.Repository", FakeRepository)
+
+    processed = await worker.run_once()
+
+    assert processed == 1
+    assert len(telegram.send_message_calls) == 2
+    assert state.tasks[task.outbox_id].status == TaskStatus.DONE
+    assert state.attempts == [
+        {
+            "outbox_id": task.outbox_id,
+            "attempt_no": 1,
+            "outcome": DeliveryOutcome.SUCCESS,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delivery_persists_all_group_destination_ids_for_delete_and_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    bridge_id = uuid.uuid4()
+    task = make_task(
+        action="send",
+        bridge_id=bridge_id,
+        dst_platform=Platform.TELEGRAM,
+        task_payload={
+            "src": {"platform": "max", "chat_id": "300", "message_id": "mid-delete"},
+            "dst": {"platform": "telegram", "chat_id": "-100"},
+            "text": "Alice: album",
+            "fallback_text": "Alice: [photo group]",
+            "has_media": True,
+            "media_kind": "photo_video_chunk",
+            "group_kind": "photo_video_chunk",
+            "group_key": "max:300:mid-delete",
+            "media": None,
+            "media_items": [
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-1",
+                    filename="one.jpg",
+                    mime_type="image/jpeg",
+                ),
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-2",
+                    filename="two.jpg",
+                    mime_type="image/jpeg",
+                ),
+                media_payload(
+                    source_platform=Platform.MAX,
+                    kind="image",
+                    identity="max:image:id:photo-3",
+                    filename="three.jpg",
+                    mime_type="image/jpeg",
+                ),
+            ],
+        },
+    )
+    state = DeliveryState(tasks={task.outbox_id: task})
+    database = FakeDatabase(state)
+    telegram = FakeClient("telegram", state=state)
+    max_client = FakeClient(
+        "max",
+        state=state,
+        download_kind=MediaKind.IMAGE,
+        download_size_by_identity={
+            "max:image:id:photo-1": 8 * 1024 * 1024,
+            "max:image:id:photo-2": 12 * 1024 * 1024,
+            "max:image:id:photo-3": 8 * 1024 * 1024,
+        },
+    )
+    worker = make_worker(
+        tmp_path,
+        {
+            Platform.TELEGRAM: telegram,
+            Platform.MAX: max_client,
+        },
+        database=database,
+    )
+    monkeypatch.setattr("maxogram.workers.delivery.Repository", FakeRepository)
+
+    processed = await worker.run_once()
+
+    assert processed == 1
+    repo = FakeRepository(FakeSession(state))
+    dst_ids = await repo.list_destination_message_ids(
+        bridge_id,
+        Platform.MAX,
+        "300",
+        "mid-delete",
+    )
+    assert dst_ids == ["telegram-media-1", "telegram-text-1", "telegram-media-2"]
+    snapshot = state.created_send_snapshots[
+        (bridge_id, Platform.MAX, "300", "mid-delete", Platform.TELEGRAM)
+    ]
+    assert snapshot["delivery_state"]["shape"] == "group_multi_piece"
+    assert snapshot["delivery_state"]["media_filtered"] is True
+    assert snapshot["delivery_state"]["emitted_message_ids"] == dst_ids
+
+    delete_context = make_context(
+        action="delete",
+        bridge_id=bridge_id,
+        dst_platform=Platform.TELEGRAM,
+        task_payload={
+            "src": {"platform": "max", "chat_id": "300", "message_id": "mid-delete"},
+            "dst": {"platform": "telegram", "chat_id": "-100"},
+            "dst_message_id": dst_ids[0],
+            "dst_message_ids": dst_ids,
+            "group_kind": "photo_video_chunk",
+            "media_items": [media_payload(source_platform=Platform.MAX, kind="image", identity="max:image:id:photo-1")],
+        },
+    )
+
+    await worker._call_platform(delete_context)
+
+    assert telegram.delete_calls == [
+        {"chat_id": "-100", "message_id": "telegram-media-1"},
+        {"chat_id": "-100", "message_id": "telegram-text-1"},
+        {"chat_id": "-100", "message_id": "telegram-media-2"},
+    ]
 
 
 @pytest.mark.asyncio

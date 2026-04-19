@@ -580,6 +580,31 @@ class Repository:
             )
         )
 
+    async def get_created_send_payload(
+        self,
+        bridge_id: uuid.UUID,
+        src_platform: Platform,
+        src_chat_id: str,
+        src_message_id: str,
+        dst_platform: Platform,
+    ) -> dict[str, Any] | None:
+        return await self.session.scalar(
+            select(OutboxTask.task)
+            .join(CanonicalEvent, CanonicalEvent.event_id == OutboxTask.src_event_id)
+            .where(
+                CanonicalEvent.bridge_id == bridge_id,
+                CanonicalEvent.src_platform == src_platform,
+                CanonicalEvent.src_chat_id == src_chat_id,
+                CanonicalEvent.src_message_id == src_message_id,
+                CanonicalEvent.type == "message.created",
+                OutboxTask.action == OutboxAction.SEND.value,
+                OutboxTask.dst_platform == dst_platform,
+                OutboxTask.status == TaskStatus.DONE,
+            )
+            .order_by(OutboxTask.seq)
+            .limit(1)
+        )
+
     async def upsert_message_chunk(
         self,
         *,
@@ -872,10 +897,22 @@ class Repository:
         src_message_id: str | None,
         group_kind: str | None = None,
         src_member_message_ids: list[str] | None = None,
+        delivery_state: dict[str, Any] | None = None,
     ) -> bool:
         task = await self._get_inflight_outbox(outbox_id, attempt_count)
         if task is None:
             return False
+        effective_dst_message_ids = (
+            list(dst_message_ids)
+            if dst_message_ids
+            else ([dst_message_id] if dst_message_id is not None else [])
+        )
+        task.task = _successful_outbox_task_payload(
+            task.task,
+            dst_message_id=dst_message_id,
+            dst_message_ids=effective_dst_message_ids,
+            delivery_state=delivery_state,
+        )
         if (
             dst_message_id is not None
             and src_platform is not None
@@ -917,7 +954,6 @@ class Repository:
                     chat_id=src_chat_id,
                     message_ids=src_member_message_ids,
                 )
-            effective_dst_message_ids = dst_message_ids or [dst_message_id]
             if effective_dst_message_ids:
                 await self.replace_message_chunk_members(
                     chunk_id=chunk_id,
@@ -1301,6 +1337,27 @@ class Repository:
                 error_message=error_message,
             )
         )
+
+
+def _successful_outbox_task_payload(
+    payload: dict[str, Any],
+    *,
+    dst_message_id: str | None,
+    dst_message_ids: list[str],
+    delivery_state: dict[str, Any] | None,
+) -> dict[str, Any]:
+    updated = dict(payload)
+    effective_ids = [str(message_id) for message_id in dst_message_ids if message_id]
+    if not effective_ids and dst_message_id is not None:
+        effective_ids = [str(dst_message_id)]
+    if effective_ids:
+        updated["dst_message_id"] = effective_ids[0]
+        updated["dst_message_ids"] = effective_ids
+    elif dst_message_id is not None:
+        updated["dst_message_id"] = str(dst_message_id)
+    if delivery_state is not None:
+        updated["delivery_state"] = delivery_state
+    return updated
 
 
 def _rowcount(result: object) -> int:

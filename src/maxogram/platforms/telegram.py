@@ -33,7 +33,10 @@ from maxogram.domain import (
     SendResult,
 )
 from maxogram.metrics import telegram_skipped_update_total
-from maxogram.services.media import TELEGRAM_DOWNLOAD_LIMIT_BYTES
+from maxogram.services.media import (
+    OUTBOUND_MEDIA_COUNT_LIMIT,
+    TELEGRAM_DOWNLOAD_LIMIT_BYTES,
+)
 
 from .base import PlatformDeliveryError
 
@@ -134,13 +137,22 @@ class TelegramClient:
                     reply_parameters=reply_parameters,
                 )
             elif isinstance(media, list):
-                return await self._send_media_group(
-                    chat_id=chat_id,
-                    text_plain=text_plain,
-                    text_html=text_html,
-                    reply_parameters=reply_parameters,
-                    media_items=media,
-                )
+                if len(media) == 1:
+                    message = await self._send_media(
+                        chat_id=chat_id,
+                        text_plain=text_plain,
+                        text_html=text_html,
+                        reply_parameters=reply_parameters,
+                        media=media[0],
+                    )
+                else:
+                    return await self._send_media_group(
+                        chat_id=chat_id,
+                        text_plain=text_plain,
+                        text_html=text_html,
+                        reply_parameters=reply_parameters,
+                        media_items=media,
+                    )
             else:
                 message = await self._send_media(
                     chat_id=chat_id,
@@ -158,11 +170,7 @@ class TelegramClient:
                 str(exc), retryable=False, code="forbidden", http_status=403
             ) from exc
         except TelegramAPIError as exc:
-            raise PlatformDeliveryError(
-                str(exc),
-                retryable=_is_retryable_telegram(exc),
-                code=exc.__class__.__name__,
-            ) from exc
+            raise _telegram_delivery_error(exc) from exc
         message_id = str(message.message_id)
         raw = _serialize_sent_message(
             message,
@@ -218,11 +226,7 @@ class TelegramClient:
                     parse_mode=parse_mode,
                 )
         except TelegramAPIError as exc:
-            raise PlatformDeliveryError(
-                str(exc),
-                retryable=_is_retryable_telegram(exc),
-                code=exc.__class__.__name__,
-            ) from exc
+            raise _telegram_delivery_error(exc) from exc
 
     async def delete_message(self, chat_id: str, message_id: str) -> None:
         try:
@@ -232,11 +236,7 @@ class TelegramClient:
         except TelegramAPIError as exc:
             if _is_missing_telegram_message_error(exc):
                 return
-            raise PlatformDeliveryError(
-                str(exc),
-                retryable=_is_retryable_telegram(exc),
-                code=exc.__class__.__name__,
-            ) from exc
+            raise _telegram_delivery_error(exc) from exc
 
     async def download_media(
         self,
@@ -255,11 +255,7 @@ class TelegramClient:
         try:
             telegram_file = await self.bot.get_file(file_id)
         except TelegramAPIError as exc:
-            raise PlatformDeliveryError(
-                str(exc),
-                retryable=_is_retryable_telegram(exc),
-                code=exc.__class__.__name__,
-            ) from exc
+            raise _telegram_delivery_error(exc) from exc
         file_path = telegram_file.file_path
         if not file_path:
             return None
@@ -271,11 +267,7 @@ class TelegramClient:
         try:
             await self.bot.download_file(file_path, destination=destination)
         except TelegramAPIError as exc:
-            raise PlatformDeliveryError(
-                str(exc),
-                retryable=_is_retryable_telegram(exc),
-                code=exc.__class__.__name__,
-            ) from exc
+            raise _telegram_delivery_error(exc) from exc
         return LocalMediaFile(
             kind=_media_kind(media.get("kind")),
             path=destination,
@@ -372,32 +364,30 @@ class TelegramClient:
         reply_parameters: ReplyParameters | None,
         media_items: list[LocalMediaFile],
     ) -> SendResult:
-        if not media_items:
+        if len(media_items) < 2:
             raise PlatformDeliveryError(
-                "Telegram media group cannot be empty",
+                "Telegram media group must contain at least two items",
+                retryable=False,
+                code="invalid_media_group",
+            )
+        if len(media_items) > OUTBOUND_MEDIA_COUNT_LIMIT:
+            raise PlatformDeliveryError(
+                "Telegram media group exceeds the 10-item limit",
                 retryable=False,
                 code="invalid_media_group",
             )
         caption, parse_mode = _telegram_caption_payload(text_plain, text_html)
         chat_ref = _telegram_chat_id(chat_id)
-        sent_messages: list[Any] = []
-        remaining_caption = caption
-        remaining_parse_mode = parse_mode
-        for start in range(0, len(media_items), 10):
-            chunk = media_items[start : start + 10]
-            input_media = _telegram_input_media_group_chunk(
-                chunk,
-                caption=remaining_caption,
-                parse_mode=remaining_parse_mode,
-            )
-            result = await self.bot.send_media_group(
-                chat_id=chat_ref,
-                media=input_media,
-                reply_parameters=reply_parameters if not sent_messages else None,
-            )
-            sent_messages.extend(result)
-            remaining_caption = None
-            remaining_parse_mode = None
+        input_media = _telegram_input_media_group_chunk(
+            media_items,
+            caption=caption,
+            parse_mode=parse_mode,
+        )
+        sent_messages = await self.bot.send_media_group(
+            chat_id=chat_ref,
+            media=input_media,
+            reply_parameters=reply_parameters,
+        )
         if not sent_messages:
             raise PlatformDeliveryError(
                 "Telegram returned empty media-group send result",
@@ -571,7 +561,31 @@ def _media_presentation(value: object) -> MediaPresentation | None:
 
 
 def _is_retryable_telegram(exc: TelegramAPIError) -> bool:
-    return not isinstance(exc, TelegramForbiddenError)
+    return not (
+        isinstance(exc, TelegramForbiddenError) or _is_telegram_entity_too_large(exc)
+    )
+
+
+def _telegram_delivery_error(exc: TelegramAPIError) -> PlatformDeliveryError:
+    if _is_telegram_entity_too_large(exc):
+        return PlatformDeliveryError(
+            str(exc),
+            retryable=False,
+            code="entity_too_large",
+            http_status=413,
+        )
+    return PlatformDeliveryError(
+        str(exc),
+        retryable=_is_retryable_telegram(exc),
+        code=exc.__class__.__name__,
+    )
+
+
+def _is_telegram_entity_too_large(exc: TelegramAPIError) -> bool:
+    if exc.__class__.__name__ == "TelegramEntityTooLarge":
+        return True
+    message = str(exc).casefold()
+    return "request entity too large" in message or "entity too large" in message
 
 
 def _is_missing_telegram_message_error(exc: TelegramAPIError) -> bool:

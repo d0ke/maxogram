@@ -9,7 +9,7 @@ import pytest
 from maxapi.enums.parse_mode import TextFormat
 
 from maxogram.domain import LocalMediaFile, MediaKind, MediaPresentation
-from maxogram.platforms.max import DownloadedMediaInfo, MaxClient
+from maxogram.platforms.max import DownloadedMediaInfo, MaxClient, _max_error
 
 
 def make_client() -> MaxClient:
@@ -51,6 +51,13 @@ class FakeSendResult:
     ) -> dict[str, object]:
         _ = mode, by_alias, exclude_none
         return {"message": {"body": {"mid": self.message.body.mid}}}
+
+
+class FakeMaxApiError(Exception):
+    def __init__(self, *, code: int, raw: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.raw = raw
 
 
 @pytest.mark.asyncio
@@ -246,6 +253,24 @@ async def test_send_message_with_media_group_uses_multiple_attachments(
     assert result.message_id == "mid-200"
     send_call = client.bot.send_message_calls[0]  # type: ignore[attr-defined]
     assert len(send_call["attachments"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_max_error_marks_entity_too_large_as_non_retryable() -> None:
+    error = _max_error(
+        cast(
+            Any,
+            FakeMaxApiError(
+                code=413,
+                raw="Request Entity Too Large",
+                message="too large",
+            ),
+        )
+    )
+
+    assert error.code == "entity_too_large"
+    assert error.retryable is False
+    assert error.http_status == 413
 
 
 @pytest.mark.asyncio

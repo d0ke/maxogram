@@ -22,6 +22,14 @@
 
 ## 2026-04-19
 
+- Fixed destination-side oversized media handling after grouped `photo/video` relay changes by moving real chunk planning into the delivery worker and basing decisions on actual materialized file sizes instead of source-payload guesses.
+- Added bidirectional outbound media budgeting and ordered splitting for `MAX -> Telegram` and `Telegram -> MAX`, including a `10`-item cap, a `48 MB` internal multi-piece packing budget, Telegram upload hard limits (`10 MB` photo, `50 MB` other uploads), and the existing project `50 MB` MAX upload limit.
+- Reworked grouped delivery so one logical source chunk can emit multiple ordered destination messages plus inline bracketed oversize hint stubs, while persisting the full emitted destination id list for delete/reply/edit flows without a schema migration.
+- Added non-retryable oversized upload classification for Telegram and MAX destination errors, local in-attempt refinement of failing media pieces, and immediate text fallback for single media that is too large even alone, preventing retry storms for deterministic `413` / `entity too large` failures.
+- Enriched successful `outbox_tasks.task` payloads with `delivery_state` snapshots that record the actual delivery shape, whether media was filtered out, and the ordered emitted destination ids, and added repository access to the created successful send snapshot so edit classification can distinguish real text fallbacks and split groups from source intent.
+- Tightened grouped edit rules to keep the Telegram caption-only optimization only for actual single-piece deliveries with matching media identities, while any split or filtered group now uses delete-and-recreate symmetrically and single-media text fallbacks are edited as text rather than media.
+- Preserved MAX attachment `size` metadata for `image` and `video` payloads when MAX already exposes it, while keeping correctness anchored to local file size after download.
+- Added regression coverage for oversize single-media fallbacks, bidirectional byte-based group splitting, per-item oversize stubs, same-attempt oversize piece refinement, actual-delivery snapshot persistence, expanded grouped delete coverage, Telegram oversize error classification, and MAX `413` classification.
 - Added native grouped `photo/video` chunk relay between Telegram and MAX, including mixed `photo + video` chunks, while keeping existing single-message media flows unchanged.
 - Reworked normalization so one MAX message with multiple supported `image/video` attachments becomes one logical chunk event with ordered `media_items[]`, stable `group_key`, and chunk-scoped caption handling.
 - Added durable Telegram media-group buffering with a quiet-window flush model keyed by `telegram:<chat_id>:<media_group_id>`, so Telegram album members are aggregated into one canonical chunk event instead of being mirrored as separate MAX messages.

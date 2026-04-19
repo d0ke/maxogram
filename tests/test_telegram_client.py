@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from aiogram.exceptions import TelegramAPIError
 
 from maxogram.domain import LocalMediaFile, MediaKind, MediaPresentation
 from maxogram.platforms.base import PlatformDeliveryError
@@ -110,6 +111,12 @@ class FakeBot:
     async def edit_message_media(self, **kwargs: object) -> FakeTelegramMessage:
         self.edit_message_media_calls.append(dict(kwargs))
         return FakeTelegramMessage(203, "media")
+
+
+class FakeTelegramEntityTooLarge(TelegramAPIError):
+    def __init__(self) -> None:
+        self.message = "Request Entity Too Large"
+        Exception.__init__(self, self.message)
 
 
 def make_client(bot: FakeBot) -> TelegramClient:
@@ -261,6 +268,59 @@ async def test_send_message_uses_media_group_for_multiple_photo_video_items(
     media = cast(list[Any], bot.send_media_group_calls[0]["media"])
     assert media[0].caption == "Alice: album"
     assert media[1].caption is None
+
+
+@pytest.mark.asyncio
+async def test_send_message_rejects_media_group_above_ten_items(tmp_path: Path) -> None:
+    bot = FakeBot()
+    client = make_client(bot)
+    media_items = []
+    for index in range(11):
+        file_path = tmp_path / f"{index}.jpg"
+        file_path.write_bytes(b"jpg")
+        media_items.append(
+            LocalMediaFile(
+                kind=MediaKind.IMAGE,
+                path=file_path,
+                filename=f"{index}.jpg",
+                mime_type="image/jpeg",
+            )
+        )
+
+    with pytest.raises(PlatformDeliveryError) as exc_info:
+        await client.send_message("-100", "Alice: album", media=media_items)
+
+    assert exc_info.value.code == "invalid_media_group"
+    assert bot.send_media_group_calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_message_marks_entity_too_large_as_non_retryable(
+    tmp_path: Path,
+) -> None:
+    bot = FakeBot()
+    client = make_client(bot)
+    file_path = tmp_path / "big.jpg"
+    file_path.write_bytes(b"jpg")
+    media = LocalMediaFile(
+        kind=MediaKind.IMAGE,
+        path=file_path,
+        filename="big.jpg",
+        mime_type="image/jpeg",
+    )
+
+    async def fail_send_photo(**kwargs: object) -> FakeTelegramMessage:
+        _ = kwargs
+        raise FakeTelegramEntityTooLarge()
+
+    bot.send_photo = fail_send_photo  # type: ignore[method-assign]
+
+    with pytest.raises(PlatformDeliveryError) as exc_info:
+        await client.send_message("-100", "Alice:", media=media)
+
+    assert exc_info.value.code == "entity_too_large"
+    assert exc_info.value.retryable is False
+    assert exc_info.value.http_status == 413
 
 
 @pytest.mark.asyncio

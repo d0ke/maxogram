@@ -61,6 +61,18 @@ class FakeRepository(Repository):
         )
         return self.destination_mapping
 
+    async def list_destination_message_ids(
+        self,
+        bridge_id: uuid.UUID,
+        src_platform: Platform,
+        src_chat_id: str,
+        src_message_id: str,
+    ) -> list[str]:
+        _ = bridge_id, src_platform, src_chat_id, src_message_id
+        if self.source_mapping is None:
+            return []
+        return [self.source_mapping.dst_message_id]
+
 
 class ProcessingRepository(FakeRepository):
     def __init__(
@@ -120,6 +132,73 @@ class ProcessingRepository(FakeRepository):
     async def enqueue_outbox(self, **kwargs: Any) -> uuid.UUID:
         self.enqueued.append(kwargs)
         return uuid.uuid4()
+
+
+class GroupedProcessingRepository(ProcessingRepository):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.buffers: dict[str, Any] = {}
+        self.buffer_members: dict[uuid.UUID, list[Any]] = {}
+
+    async def buffer_telegram_media_group_update(
+        self,
+        *,
+        chat_id: str,
+        media_group_id: str,
+        group_key: str,
+        message_id: str,
+        raw_message: dict[str, Any],
+        flush_after: datetime,
+    ) -> None:
+        buffer = self.buffers.get(group_key)
+        if buffer is None:
+            buffer = SimpleNamespace(
+                buffer_id=uuid.uuid4(),
+                chat_id=chat_id,
+                media_group_id=media_group_id,
+                group_key=group_key,
+                anchor_message_id=message_id,
+                pending_flush=True,
+                has_flushed=False,
+                flush_after=flush_after,
+            )
+            self.buffers[group_key] = buffer
+            self.buffer_members[buffer.buffer_id] = []
+        else:
+            buffer.pending_flush = True
+            buffer.flush_after = max(buffer.flush_after, flush_after)
+        members = self.buffer_members[buffer.buffer_id]
+        existing = next(
+            (item for item in members if item.message_id == message_id),
+            None,
+        )
+        if existing is None:
+            members.append(
+                SimpleNamespace(
+                    message_id=message_id,
+                    raw_message=raw_message,
+                    position=0,
+                )
+            )
+        else:
+            existing.raw_message = raw_message
+        _resequence_group_members(members)
+
+    async def claim_flushable_telegram_media_groups(self, limit: int) -> list[Any]:
+        ready = [
+            buffer
+            for buffer in self.buffers.values()
+            if buffer.pending_flush
+        ]
+        return ready[:limit]
+
+    async def list_telegram_media_group_members(self, buffer_id: uuid.UUID) -> list[Any]:
+        members = self.buffer_members[buffer_id]
+        return sorted(members, key=lambda item: item.position)
+
+    async def mark_telegram_media_group_flushed(self, buffer: Any) -> None:
+        buffer.pending_flush = False
+        buffer.has_flushed = True
 
 
 def make_worker() -> NormalizerWorker:
@@ -201,6 +280,22 @@ def make_supported_media_payload(
             },
         }
     }
+
+
+def _resequence_group_members(members: list[Any]) -> None:
+    ordered_members = sorted(
+        members,
+        key=lambda item: _telegram_message_order_key(item.message_id),
+    )
+    for index, member in enumerate(ordered_members, start=1):
+        member.position = index
+
+
+def _telegram_message_order_key(message_id: str) -> tuple[int, int | str]:
+    try:
+        return (0, int(message_id))
+    except (TypeError, ValueError):
+        return (1, message_id)
 
 
 @pytest.mark.asyncio
@@ -685,3 +780,139 @@ async def test_process_row_uses_telegram_from_user_for_identity_and_alias():
     task = cast(dict[str, Any], repo.enqueued[0]["task"])
     assert task["src"]["user_id"] == "42"
     assert task["text_plain"] == "Alice Bob: hello"
+
+
+@pytest.mark.asyncio
+async def test_flush_ready_telegram_media_group_enqueues_one_grouped_task():
+    repo = GroupedProcessingRepository(dst_platform=Platform.MAX, dst_chat_id="200")
+    worker = make_worker()
+    received_at = datetime.now(UTC)
+
+    await worker._process_row(
+        repo,
+        Platform.TELEGRAM,
+        {
+            "update_id": 200,
+            "message": {
+                "message_id": 300,
+                "date": 1_700_000_000,
+                "chat": {"id": -100},
+                "from": {"id": 42, "first_name": "Alice", "is_bot": False},
+                "media_group_id": "grp-1",
+                "caption": "album",
+                "photo": [{"file_id": "photo-1", "file_unique_id": "photo-1"}],
+            },
+        },
+        uuid.uuid4(),
+        received_at,
+    )
+    await worker._process_row(
+        repo,
+        Platform.TELEGRAM,
+        {
+            "update_id": 201,
+            "message": {
+                "message_id": 301,
+                "date": 1_700_000_001,
+                "chat": {"id": -100},
+                "from": {"id": 42, "first_name": "Alice", "is_bot": False},
+                "media_group_id": "grp-1",
+                "video": {
+                    "file_id": "video-1",
+                    "file_unique_id": "video-1",
+                    "file_size": 2048,
+                },
+            },
+        },
+        uuid.uuid4(),
+        received_at,
+    )
+
+    flushed = await worker._flush_ready_telegram_media_groups(repo)
+
+    assert flushed == 1
+    assert len(repo.enqueued) == 1
+    queued = repo.enqueued[0]
+    task = cast(dict[str, Any], queued["task"])
+    assert task["dst"] == {"platform": "max", "chat_id": "200"}
+    assert task["group_kind"] == "photo_video_chunk"
+    assert task["group_key"] == "telegram:-100:grp-1"
+    assert task["source_member_message_ids"] == ["300", "301"]
+    assert [item["kind"] for item in cast(list[dict[str, Any]], task["media_items"])] == [
+        "image",
+        "video",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_flush_ready_telegram_media_group_orders_members_by_message_id():
+    repo = GroupedProcessingRepository(dst_platform=Platform.MAX, dst_chat_id="200")
+    worker = make_worker()
+    received_at = datetime.now(UTC)
+    updates = [
+        (
+            411,
+            {
+                "photo": [{"file_id": "photo-411", "file_unique_id": "photo-411"}],
+                "caption": "album",
+            },
+        ),
+        (
+            414,
+            {
+                "video": {
+                    "file_id": "video-414",
+                    "file_unique_id": "video-414",
+                    "file_size": 2048,
+                }
+            },
+        ),
+        (
+            413,
+            {
+                "photo": [{"file_id": "photo-413", "file_unique_id": "photo-413"}],
+            },
+        ),
+        (
+            412,
+            {
+                "video": {
+                    "file_id": "video-412",
+                    "file_unique_id": "video-412",
+                    "file_size": 2048,
+                }
+            },
+        ),
+    ]
+
+    for message_id, media_payload in updates:
+        await worker._process_row(
+            repo,
+            Platform.TELEGRAM,
+            {
+                "update_id": message_id,
+                "message": {
+                    "message_id": message_id,
+                    "date": 1_700_000_000 + message_id,
+                    "chat": {"id": -100},
+                    "from": {"id": 42, "first_name": "Alice", "is_bot": False},
+                    "media_group_id": "grp-ordered",
+                    **media_payload,
+                },
+            },
+            uuid.uuid4(),
+            received_at,
+        )
+
+    flushed = await worker._flush_ready_telegram_media_groups(repo)
+
+    assert flushed == 1
+    assert len(repo.enqueued) == 1
+    task = cast(dict[str, Any], repo.enqueued[0]["task"])
+    assert task["source_member_message_ids"] == ["411", "412", "413", "414"]
+    assert [item["kind"] for item in cast(list[dict[str, Any]], task["media_items"])] == [
+        "image",
+        "video",
+        "image",
+        "video",
+    ]

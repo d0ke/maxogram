@@ -113,7 +113,7 @@ class MaxClient:
         *,
         text_html: str | None = None,
         reply_to_message_id: str | None = None,
-        media: LocalMediaFile | None = None,
+        media: LocalMediaFile | list[LocalMediaFile] | None = None,
     ) -> SendResult:
         await self.rate_limiter.wait()
         rendered_text, text_format = _max_text_payload(text_plain, text_html)
@@ -122,11 +122,15 @@ class MaxClient:
             if reply_to_message_id
             else None
         )
-        attachments = (
-            [InputMedia(str(media.path), type=_upload_type(media.kind))]
-            if media is not None
-            else None
-        )
+        if isinstance(media, list):
+            attachments = [
+                InputMedia(str(item.path), type=_upload_type(item.kind))
+                for item in media
+            ]
+        elif media is not None:
+            attachments = [InputMedia(str(media.path), type=_upload_type(media.kind))]
+        else:
+            attachments = None
         if attachments is not None and rendered_text == "" and text_format is None:
             rendered_text = None
         try:
@@ -155,7 +159,7 @@ class MaxClient:
         *,
         text_html: str | None = None,
         has_media: bool = False,
-        replacement_media: LocalMediaFile | None = None,
+        replacement_media: LocalMediaFile | list[LocalMediaFile] | None = None,
     ) -> None:
         _ = chat_id, has_media
         await self.rate_limiter.wait()
@@ -173,11 +177,17 @@ class MaxClient:
                     json=payload,
                 )
             else:
+                replacement_items = (
+                    replacement_media
+                    if isinstance(replacement_media, list)
+                    else [replacement_media]
+                )
                 attachments = [
                     InputMedia(
-                        str(replacement_media.path),
-                        type=_upload_type(replacement_media.kind),
+                        str(item.path),
+                        type=_upload_type(item.kind),
                     )
+                    for item in replacement_items
                 ]
                 await self.bot.edit_message(
                     message_id=message_id,
@@ -308,12 +318,15 @@ class MaxClient:
 
 def _max_error(exc: MaxApiError) -> PlatformDeliveryError:
     raw = exc.raw.lower() if isinstance(exc.raw, str) else str(exc.raw).lower()
-    permanent = exc.code in {400, 401, 403, 404} and "attachment.not.ready" not in raw
+    oversize = exc.code == 413 or "entity too large" in raw or "too large" in raw
+    permanent = oversize or (
+        exc.code in {400, 401, 403, 404} and "attachment.not.ready" not in raw
+    )
     return PlatformDeliveryError(
         str(exc),
         retryable=not permanent,
-        code=str(exc.code),
-        http_status=exc.code,
+        code="entity_too_large" if oversize else str(exc.code),
+        http_status=413 if oversize else exc.code,
     )
 
 

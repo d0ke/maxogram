@@ -3,6 +3,7 @@ from __future__ import annotations
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from sqlalchemy import Select, func, select, text, update
@@ -30,6 +31,8 @@ from .models import (
     DeliveryAttempt,
     InboxUpdate,
     LinkCode,
+    MessageChunk,
+    MessageChunkMember,
     MessageMapping,
     OutboxTask,
     PendingMutation,
@@ -37,6 +40,8 @@ from .models import (
     PlatformIdentity,
     ProxyProfile,
     Tenant,
+    TelegramMediaGroupBuffer,
+    TelegramMediaGroupBufferMember,
 )
 
 
@@ -134,6 +139,107 @@ class Repository:
 
     async def mark_inbox(self, inbox: InboxUpdate, status: RowStatus) -> None:
         inbox.status = status
+
+    async def buffer_telegram_media_group_update(
+        self,
+        *,
+        chat_id: str,
+        media_group_id: str,
+        group_key: str,
+        message_id: str,
+        raw_message: dict[str, Any],
+        flush_after: datetime,
+    ) -> None:
+        buffer = await self.session.scalar(
+            select(TelegramMediaGroupBuffer)
+            .where(TelegramMediaGroupBuffer.group_key == group_key)
+            .with_for_update()
+        )
+        if buffer is None:
+            buffer = TelegramMediaGroupBuffer(
+                buffer_id=uuid.uuid4(),
+                group_key=group_key,
+                chat_id=chat_id,
+                media_group_id=media_group_id,
+                anchor_message_id=message_id,
+                pending_flush=True,
+                has_flushed=False,
+                flush_after=flush_after,
+                updated_at=datetime.now(UTC),
+            )
+            self.session.add(buffer)
+            await self.session.flush()
+        else:
+            buffer.chat_id = chat_id
+            buffer.media_group_id = media_group_id
+            buffer.pending_flush = True
+            buffer.flush_after = max(buffer.flush_after, flush_after)
+            if buffer.anchor_message_id is None:
+                buffer.anchor_message_id = message_id
+            buffer.updated_at = datetime.now(UTC)
+
+        member = await self.session.scalar(
+            select(TelegramMediaGroupBufferMember)
+            .where(
+                TelegramMediaGroupBufferMember.buffer_id == buffer.buffer_id,
+                TelegramMediaGroupBufferMember.message_id == message_id,
+            )
+            .with_for_update()
+        )
+        if member is None:
+            member = TelegramMediaGroupBufferMember(
+                buffer_member_id=uuid.uuid4(),
+                buffer_id=buffer.buffer_id,
+                message_id=message_id,
+                position=0,
+                raw_message=raw_message,
+                updated_at=datetime.now(UTC),
+            )
+            self.session.add(member)
+        else:
+            member.raw_message = raw_message
+            member.updated_at = datetime.now(UTC)
+        await self.session.flush()
+        await self._resequence_telegram_media_group_members(buffer.buffer_id)
+
+    async def claim_flushable_telegram_media_groups(
+        self,
+        limit: int,
+    ) -> list[TelegramMediaGroupBuffer]:
+        now = datetime.now(UTC)
+        stmt = (
+            select(TelegramMediaGroupBuffer)
+            .where(
+                TelegramMediaGroupBuffer.pending_flush.is_(True),
+                TelegramMediaGroupBuffer.flush_after <= now,
+            )
+            .order_by(
+                TelegramMediaGroupBuffer.flush_after,
+                TelegramMediaGroupBuffer.created_at,
+            )
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        return list((await self.session.scalars(stmt)).all())
+
+    async def list_telegram_media_group_members(
+        self,
+        buffer_id: uuid.UUID,
+    ) -> list[TelegramMediaGroupBufferMember]:
+        stmt = (
+            select(TelegramMediaGroupBufferMember)
+            .where(TelegramMediaGroupBufferMember.buffer_id == buffer_id)
+            .order_by(TelegramMediaGroupBufferMember.position)
+        )
+        return list((await self.session.scalars(stmt)).all())
+
+    async def mark_telegram_media_group_flushed(
+        self,
+        buffer: TelegramMediaGroupBuffer,
+    ) -> None:
+        buffer.pending_flush = False
+        buffer.has_flushed = True
+        buffer.updated_at = datetime.now(UTC)
 
     async def find_bridge_by_chat(
         self,
@@ -308,7 +414,7 @@ class Repository:
         event_type: str,
         happened_at: datetime,
         payload: dict[str, Any],
-        raw_inbox_id: uuid.UUID,
+        raw_inbox_id: uuid.UUID | None,
     ) -> uuid.UUID | None:
         event_id = uuid.uuid4()
         stmt = (
@@ -377,13 +483,22 @@ class Repository:
         src_chat_id: str,
         src_message_id: str,
     ) -> MessageMapping | None:
-        return await self.session.scalar(
+        mapping = await self.session.scalar(
             select(MessageMapping).where(
                 MessageMapping.bridge_id == bridge_id,
                 MessageMapping.src_platform == src_platform,
                 MessageMapping.src_chat_id == src_chat_id,
                 MessageMapping.src_message_id == src_message_id,
             )
+        )
+        if mapping is not None:
+            return mapping
+        return await self._find_chunk_mapping_by_member(
+            bridge_id=bridge_id,
+            platform=src_platform,
+            chat_id=src_chat_id,
+            message_id=src_message_id,
+            member_role="src",
         )
 
     async def find_mapping_by_destination(
@@ -393,7 +508,7 @@ class Repository:
         dst_chat_id: str,
         dst_message_id: str,
     ) -> MessageMapping | None:
-        return await self.session.scalar(
+        mapping = await self.session.scalar(
             select(MessageMapping).where(
                 MessageMapping.bridge_id == bridge_id,
                 MessageMapping.dst_platform == dst_platform,
@@ -401,6 +516,52 @@ class Repository:
                 MessageMapping.dst_message_id == dst_message_id,
             )
         )
+        if mapping is not None:
+            return mapping
+        return await self._find_chunk_mapping_by_member(
+            bridge_id=bridge_id,
+            platform=dst_platform,
+            chat_id=dst_chat_id,
+            message_id=dst_message_id,
+            member_role="dst",
+        )
+
+    async def list_destination_message_ids(
+        self,
+        bridge_id: uuid.UUID,
+        src_platform: Platform,
+        src_chat_id: str,
+        src_message_id: str,
+    ) -> list[str]:
+        chunk = await self.session.scalar(
+            select(MessageChunk).where(
+                MessageChunk.bridge_id == bridge_id,
+                MessageChunk.src_platform == src_platform,
+                MessageChunk.src_chat_id == src_chat_id,
+                MessageChunk.src_message_id == src_message_id,
+            )
+        )
+        if chunk is not None:
+            members = await self.session.scalars(
+                select(MessageChunkMember.message_id)
+                .where(
+                    MessageChunkMember.chunk_id == chunk.chunk_id,
+                    MessageChunkMember.member_role == "dst",
+                )
+                .order_by(MessageChunkMember.position)
+            )
+            member_ids = list(members.all())
+            return member_ids or [chunk.dst_message_id]
+
+        mapping = await self.find_mapping_by_source(
+            bridge_id,
+            src_platform,
+            src_chat_id,
+            src_message_id,
+        )
+        if mapping is None:
+            return []
+        return [mapping.dst_message_id]
 
     async def get_created_event_payload(
         self,
@@ -418,6 +579,117 @@ class Repository:
                 CanonicalEvent.type == "message.created",
             )
         )
+
+    async def get_created_send_payload(
+        self,
+        bridge_id: uuid.UUID,
+        src_platform: Platform,
+        src_chat_id: str,
+        src_message_id: str,
+        dst_platform: Platform,
+    ) -> dict[str, Any] | None:
+        return await self.session.scalar(
+            select(OutboxTask.task)
+            .join(CanonicalEvent, CanonicalEvent.event_id == OutboxTask.src_event_id)
+            .where(
+                CanonicalEvent.bridge_id == bridge_id,
+                CanonicalEvent.src_platform == src_platform,
+                CanonicalEvent.src_chat_id == src_chat_id,
+                CanonicalEvent.src_message_id == src_message_id,
+                CanonicalEvent.type == "message.created",
+                OutboxTask.action == OutboxAction.SEND.value,
+                OutboxTask.dst_platform == dst_platform,
+                OutboxTask.status == TaskStatus.DONE,
+            )
+            .order_by(OutboxTask.seq)
+            .limit(1)
+        )
+
+    async def upsert_message_chunk(
+        self,
+        *,
+        bridge_id: uuid.UUID,
+        group_kind: str,
+        src_platform: Platform,
+        src_chat_id: str,
+        src_message_id: str,
+        dst_platform: Platform,
+        dst_chat_id: str,
+        dst_message_id: str,
+    ) -> uuid.UUID:
+        chunk_id = uuid.uuid4()
+        stmt = (
+            insert(MessageChunk)
+            .values(
+                chunk_id=chunk_id,
+                bridge_id=bridge_id,
+                group_kind=group_kind,
+                src_platform=src_platform,
+                src_chat_id=src_chat_id,
+                src_message_id=src_message_id,
+                dst_platform=dst_platform,
+                dst_chat_id=dst_chat_id,
+                dst_message_id=dst_message_id,
+                updated_at=func.now(),
+            )
+            .on_conflict_do_update(
+                index_elements=[
+                    "bridge_id",
+                    "src_platform",
+                    "src_chat_id",
+                    "src_message_id",
+                ],
+                set_={
+                    "group_kind": group_kind,
+                    "dst_platform": dst_platform,
+                    "dst_chat_id": dst_chat_id,
+                    "dst_message_id": dst_message_id,
+                    "updated_at": func.now(),
+                },
+            )
+        )
+        await self.session.execute(stmt)
+        saved = await self.session.scalar(
+            select(MessageChunk.chunk_id).where(
+                MessageChunk.bridge_id == bridge_id,
+                MessageChunk.src_platform == src_platform,
+                MessageChunk.src_chat_id == src_chat_id,
+                MessageChunk.src_message_id == src_message_id,
+            )
+        )
+        return saved or chunk_id
+
+    async def replace_message_chunk_members(
+        self,
+        *,
+        chunk_id: uuid.UUID,
+        bridge_id: uuid.UUID,
+        member_role: str,
+        platform: Platform,
+        chat_id: str,
+        message_ids: list[str],
+    ) -> None:
+        await self.session.execute(
+            text(
+                "DELETE FROM message_chunk_members "
+                "WHERE chunk_id = :chunk_id AND member_role = :member_role"
+            ),
+            {"chunk_id": chunk_id, "member_role": member_role},
+        )
+        for position, message_id in enumerate(message_ids, start=1):
+            self.session.add(
+                MessageChunkMember(
+                    chunk_member_id=uuid.uuid4(),
+                    chunk_id=chunk_id,
+                    bridge_id=bridge_id,
+                    member_role=member_role,
+                    platform=platform,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    position=position,
+                    updated_at=datetime.now(UTC),
+                )
+            )
 
     async def find_canonical_event_id_by_dedup_key(
         self, dedup_key: str
@@ -449,13 +721,18 @@ class Repository:
                 dst_chat_id=dst_chat_id,
                 dst_message_id=dst_message_id,
             )
-            .on_conflict_do_nothing(
+            .on_conflict_do_update(
                 index_elements=[
                     "bridge_id",
                     "src_platform",
                     "src_chat_id",
                     "src_message_id",
-                ]
+                ],
+                set_={
+                    "dst_platform": dst_platform,
+                    "dst_chat_id": dst_chat_id,
+                    "dst_message_id": dst_message_id,
+                },
             )
         )
 
@@ -614,13 +891,28 @@ class Repository:
         dst_platform: Platform,
         dst_chat_id: str,
         dst_message_id: str | None,
+        dst_message_ids: list[str] | None,
         src_platform: Platform | None,
         src_chat_id: str | None,
         src_message_id: str | None,
+        group_kind: str | None = None,
+        src_member_message_ids: list[str] | None = None,
+        delivery_state: dict[str, Any] | None = None,
     ) -> bool:
         task = await self._get_inflight_outbox(outbox_id, attempt_count)
         if task is None:
             return False
+        effective_dst_message_ids = (
+            list(dst_message_ids)
+            if dst_message_ids
+            else ([dst_message_id] if dst_message_id is not None else [])
+        )
+        task.task = _successful_outbox_task_payload(
+            task.task,
+            dst_message_id=dst_message_id,
+            dst_message_ids=effective_dst_message_ids,
+            delivery_state=delivery_state,
+        )
         if (
             dst_message_id is not None
             and src_platform is not None
@@ -636,6 +928,41 @@ class Repository:
                 dst_chat_id=dst_chat_id,
                 dst_message_id=dst_message_id,
             )
+        if (
+            group_kind is not None
+            and dst_message_id is not None
+            and src_platform is not None
+            and src_chat_id is not None
+            and src_message_id is not None
+        ):
+            chunk_id = await self.upsert_message_chunk(
+                bridge_id=bridge_id,
+                group_kind=group_kind,
+                src_platform=src_platform,
+                src_chat_id=src_chat_id,
+                src_message_id=src_message_id,
+                dst_platform=dst_platform,
+                dst_chat_id=dst_chat_id,
+                dst_message_id=dst_message_id,
+            )
+            if src_member_message_ids:
+                await self.replace_message_chunk_members(
+                    chunk_id=chunk_id,
+                    bridge_id=bridge_id,
+                    member_role="src",
+                    platform=src_platform,
+                    chat_id=src_chat_id,
+                    message_ids=src_member_message_ids,
+                )
+            if effective_dst_message_ids:
+                await self.replace_message_chunk_members(
+                    chunk_id=chunk_id,
+                    bridge_id=bridge_id,
+                    member_role="dst",
+                    platform=dst_platform,
+                    chat_id=dst_chat_id,
+                    message_ids=effective_dst_message_ids,
+                )
         task.status = TaskStatus.DONE
         task.inflight_until = None
         self._add_delivery_attempt(
@@ -892,6 +1219,86 @@ class Repository:
             },
         )
 
+    async def _find_chunk_mapping_by_member(
+        self,
+        *,
+        bridge_id: uuid.UUID,
+        platform: Platform,
+        chat_id: str,
+        message_id: str,
+        member_role: str,
+    ) -> MessageMapping | None:
+        row = await self.session.execute(
+            select(
+                MessageChunk.src_message_id,
+                MessageChunk.dst_message_id,
+            )
+            .join(
+                MessageChunkMember,
+                MessageChunkMember.chunk_id == MessageChunk.chunk_id,
+            )
+            .where(
+                MessageChunk.bridge_id == bridge_id,
+                MessageChunkMember.member_role == member_role,
+                MessageChunkMember.platform == platform,
+                MessageChunkMember.chat_id == chat_id,
+                MessageChunkMember.message_id == message_id,
+            )
+        )
+        result = row.first()
+        if result is None:
+            return None
+        return SimpleNamespace(
+            src_message_id=result.src_message_id,
+            dst_message_id=result.dst_message_id,
+        )
+
+    async def _resequence_telegram_media_group_members(
+        self,
+        buffer_id: uuid.UUID,
+    ) -> None:
+        members = list(
+            (
+                await self.session.scalars(
+                    select(TelegramMediaGroupBufferMember)
+                    .where(TelegramMediaGroupBufferMember.buffer_id == buffer_id)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        if not members:
+            return
+
+        ordered_members = sorted(
+            members,
+            key=lambda item: _telegram_message_order_key(item.message_id),
+        )
+        expected_positions = {
+            item.buffer_member_id: index
+            for index, item in enumerate(ordered_members, start=1)
+        }
+        original_positions = {
+            item.buffer_member_id: item.position for item in ordered_members
+        }
+        if all(
+            original_positions[item.buffer_member_id]
+            == expected_positions[item.buffer_member_id]
+            for item in ordered_members
+        ):
+            return
+
+        for item in ordered_members:
+            item.position = -expected_positions[item.buffer_member_id]
+        await self.session.flush()
+
+        reordered_at = datetime.now(UTC)
+        for item in ordered_members:
+            final_position = expected_positions[item.buffer_member_id]
+            item.position = final_position
+            if original_positions[item.buffer_member_id] != final_position:
+                item.updated_at = reordered_at
+        await self.session.flush()
+
     async def _get_inflight_outbox(
         self,
         outbox_id: uuid.UUID,
@@ -932,6 +1339,34 @@ class Repository:
         )
 
 
+def _successful_outbox_task_payload(
+    payload: dict[str, Any],
+    *,
+    dst_message_id: str | None,
+    dst_message_ids: list[str],
+    delivery_state: dict[str, Any] | None,
+) -> dict[str, Any]:
+    updated = dict(payload)
+    effective_ids = [str(message_id) for message_id in dst_message_ids if message_id]
+    if not effective_ids and dst_message_id is not None:
+        effective_ids = [str(dst_message_id)]
+    if effective_ids:
+        updated["dst_message_id"] = effective_ids[0]
+        updated["dst_message_ids"] = effective_ids
+    elif dst_message_id is not None:
+        updated["dst_message_id"] = str(dst_message_id)
+    if delivery_state is not None:
+        updated["delivery_state"] = delivery_state
+    return updated
+
+
 def _rowcount(result: object) -> int:
     value = getattr(result, "rowcount", 0)
     return int(value or 0)
+
+
+def _telegram_message_order_key(message_id: str) -> tuple[int, int | str]:
+    try:
+        return (0, int(message_id))
+    except (TypeError, ValueError):
+        return (1, message_id)

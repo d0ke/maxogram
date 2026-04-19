@@ -9,7 +9,7 @@ import pytest
 from maxapi.enums.parse_mode import TextFormat
 
 from maxogram.domain import LocalMediaFile, MediaKind, MediaPresentation
-from maxogram.platforms.max import DownloadedMediaInfo, MaxClient
+from maxogram.platforms.max import DownloadedMediaInfo, MaxClient, _max_error
 
 
 def make_client() -> MaxClient:
@@ -51,6 +51,13 @@ class FakeSendResult:
     ) -> dict[str, object]:
         _ = mode, by_alias, exclude_none
         return {"message": {"body": {"mid": self.message.body.mid}}}
+
+
+class FakeMaxApiError(Exception):
+    def __init__(self, *, code: int, raw: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.raw = raw
 
 
 @pytest.mark.asyncio
@@ -216,6 +223,57 @@ async def test_send_message_with_media_uses_attachment_only_when_text_is_empty(
 
 
 @pytest.mark.asyncio
+async def test_send_message_with_media_group_uses_multiple_attachments(
+    tmp_path: Path,
+) -> None:
+    client = make_client()
+    client.bot = FakeEditBot()  # type: ignore[attr-defined]
+    client.rate_limiter = cast(Any, NoopRateLimiter())  # type: ignore[attr-defined]
+    photo_path = tmp_path / "one.jpg"
+    video_path = tmp_path / "two.mp4"
+    photo_path.write_bytes(b"jpg")
+    video_path.write_bytes(b"mp4")
+    media_items = [
+        LocalMediaFile(
+            kind=MediaKind.IMAGE,
+            path=photo_path,
+            filename="one.jpg",
+            mime_type="image/jpeg",
+        ),
+        LocalMediaFile(
+            kind=MediaKind.VIDEO,
+            path=video_path,
+            filename="two.mp4",
+            mime_type="video/mp4",
+        ),
+    ]
+
+    result = await client.send_message("200", "album", media=media_items)
+
+    assert result.message_id == "mid-200"
+    send_call = client.bot.send_message_calls[0]  # type: ignore[attr-defined]
+    assert len(send_call["attachments"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_max_error_marks_entity_too_large_as_non_retryable() -> None:
+    error = _max_error(
+        cast(
+            Any,
+            FakeMaxApiError(
+                code=413,
+                raw="Request Entity Too Large",
+                message="too large",
+            ),
+        )
+    )
+
+    assert error.code == "entity_too_large"
+    assert error.retryable is False
+    assert error.http_status == 413
+
+
+@pytest.mark.asyncio
 async def test_edit_message_caption_only_uses_html_format_when_available() -> None:
     client = make_client()
     client.bot = FakeEditBot()  # type: ignore[attr-defined]
@@ -298,3 +356,41 @@ async def test_edit_message_replaces_media_with_html_format_when_available(
     assert edit_call["text"] == "<u>updated</u>"
     assert edit_call["format"] == TextFormat.HTML
     assert "sleep_after_input_media" not in edit_call
+
+
+@pytest.mark.asyncio
+async def test_edit_message_replaces_media_group_with_multiple_attachments(
+    tmp_path: Path,
+) -> None:
+    client = make_client()
+    client.bot = FakeEditBot()  # type: ignore[attr-defined]
+    client.rate_limiter = cast(Any, NoopRateLimiter())  # type: ignore[attr-defined]
+    photo_path = tmp_path / "one.jpg"
+    video_path = tmp_path / "two.mp4"
+    photo_path.write_bytes(b"jpg")
+    video_path.write_bytes(b"mp4")
+    media_items = [
+        LocalMediaFile(
+            kind=MediaKind.IMAGE,
+            path=photo_path,
+            filename="one.jpg",
+            mime_type="image/jpeg",
+        ),
+        LocalMediaFile(
+            kind=MediaKind.VIDEO,
+            path=video_path,
+            filename="two.mp4",
+            mime_type="video/mp4",
+        ),
+    ]
+
+    await client.edit_message(
+        "200",
+        "mid-1",
+        "updated",
+        has_media=True,
+        replacement_media=media_items,
+    )
+
+    edit_call = client.bot.edit_message_calls[0]  # type: ignore[attr-defined]
+    assert len(edit_call["attachments"]) == 2

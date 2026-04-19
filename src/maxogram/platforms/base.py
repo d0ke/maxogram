@@ -64,7 +64,7 @@ class PlatformClient(Protocol):
         *,
         text_html: str | None = None,
         reply_to_message_id: str | None = None,
-        media: LocalMediaFile | None = None,
+        media: LocalMediaFile | list[LocalMediaFile] | None = None,
     ) -> SendResult: ...
 
     async def edit_message(
@@ -75,7 +75,7 @@ class PlatformClient(Protocol):
         *,
         text_html: str | None = None,
         has_media: bool = False,
-        replacement_media: LocalMediaFile | None = None,
+        replacement_media: LocalMediaFile | list[LocalMediaFile] | None = None,
     ) -> None: ...
 
     async def delete_message(self, chat_id: str, message_id: str) -> None: ...

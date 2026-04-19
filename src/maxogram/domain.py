@@ -56,6 +56,10 @@ class MediaPresentation(StrEnum):
     ANIMATION = "animation"
 
 
+class MediaGroupKind(StrEnum):
+    PHOTO_VIDEO_CHUNK = "photo_video_chunk"
+
+
 class MutationType(StrEnum):
     EDIT = "edit"
     DELETE = "delete"
@@ -106,6 +110,7 @@ class PollBatch:
 class SendResult:
     message_id: str
     raw: dict[str, Any]
+    member_message_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

@@ -56,7 +56,7 @@ class MaxClient:
             kwargs["proxy"] = proxy_url
         connection = DefaultConnectionProperties(**kwargs)
         self.bot = Bot(token=token, default_connection=connection)
-        self.rate_limiter = RateLimiter(max_per_second=30)
+        self.rate_limiter = RateLimiter(max_per_second=1.8)
 
     async def poll_updates(
         self,

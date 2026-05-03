@@ -42,3 +42,7 @@
 - Reworked grouped delivery around actual materialized file sizes: bidirectional media budgeting, ordered splitting, per-item oversize hint stubs, same-attempt refinement, non-retryable oversize classification, and persisted `delivery_state` snapshots in successful `outbox_tasks.task` payloads.
 - Narrowed the safe caption-only grouped edit optimization for `MAX -> Telegram`, kept delete-and-recreate as the conservative grouped-edit fallback elsewhere, and expanded regression coverage for grouped normalization, delivery, deletes, edit classification, oversize handling, and repository edge cases.
 - Refreshed `architecture.md` and compressed `progress.md` so the documentation now matches the live grouped-media schema, delivery model, and current high-level project state.
+
+## 2026-05-03
+
+- Reduced the MAX platform client rate limiter from 30 requests per second to 1.8 requests per second.

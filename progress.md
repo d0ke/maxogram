@@ -46,3 +46,7 @@
 ## 2026-05-03
 
 - Reduced the MAX platform client rate limiter from 30 requests per second to 1.8 requests per second.
+
+## 2026-09-03
+
+- Refined `AGENTS.md` with an explicit new-dialog and post-compaction reading order, architecture-document maintenance rules, and a live runtime investigation procedure covering VPS container shutdown and restart, temporary files, PostgreSQL state, and direct HTTPS bot API inspection through credentials kept in `tokens.py`.
